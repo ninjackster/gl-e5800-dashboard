@@ -1281,7 +1281,7 @@ def apply_roaming(iccid, want):
 def get_repeater_status():
     st = ubus_call("repeater", "status")
     if not st or not st.get("running"):
-        return {"connected": False, "ssid": None, "signal": None, "ip": None}
+        return {"connected": False, "ssid": None, "signal": None, "ip": None, "portal": False}
     connected = st.get("state_s") == "connected"
     ip = (st.get("ipv4") or {}).get("ip", "").split("/")[0] or None
     return {
@@ -1290,6 +1290,7 @@ def get_repeater_status():
         "signal": st.get("signal"),
         "ip": ip,
         "band": st.get("band") if connected else None,
+        "portal": bool(st.get("portal")) if connected else False,
     }
 
 
@@ -3328,6 +3329,101 @@ WEATHER_CITY_ZONE = (34, 66)
 PICKER_TOP, PICKER_BOTTOM = 38, 316
 
 
+
+# ---------- devices, failover alerts, portal (fork) ----------
+DEVICE_ROW_TOP, DEVICE_ROW_H, DEVICE_MAX_ROWS = 40, 38, 7
+MONITOR_DEVICES_ZONE = (0, 34, W, 114)
+# Running cellular session for the failover alert and the Home tile:
+# bytes on the cellular netdev when traffic switched to it.
+_cell_session = {"dev": None, "start_bytes": None}
+
+
+def _fmt_bytes(n):
+    if n is None:
+        return "—"
+    for unit, div in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= div:
+            return f"{n / div:.1f} {unit}" if n < div * 100 else f"{n / div:.0f} {unit}"
+    return f"{int(n)} B"
+
+
+def _fmt_rate(bps):
+    if not bps:
+        return "0"
+    mbit = bps * 8 / 1e6
+    return f"{mbit:.1f} Mb/s" if mbit >= 0.1 else f"{bps * 8 / 1e3:.0f} kb/s"
+
+
+def _dev_bytes(dev):
+    try:
+        rx = int(_read_sys(f"/sys/class/net/{dev}/statistics/rx_bytes") or 0)
+        tx = int(_read_sys(f"/sys/class/net/{dev}/statistics/tx_bytes") or 0)
+        return rx + tx
+    except ValueError:
+        return None
+
+
+def cell_session_used():
+    dev, start = _cell_session["dev"], _cell_session["start_bytes"]
+    if not dev or start is None:
+        return None
+    now = _dev_bytes(dev)
+    return None if now is None else max(0, now - start)
+
+
+def wan_label(dev, rep=None):
+    if not dev:
+        return "No internet"
+    if dev.startswith("wlan"):
+        ssid = (rep or {}).get("ssid")
+        return f"Repeater · {ssid}" if ssid else "Repeater"
+    if dev.startswith("eth"):
+        return "Ethernet"
+    if "rmnet" in dev:
+        return "Cellular"
+    if dev.startswith("usb") or "rndis" in dev or dev.startswith("enx"):
+        return "Tethering"
+    return dev
+
+
+def get_devices():
+    """Online clients from GL's gl-clients service, busiest first."""
+    raw = ubus_call("gl-clients", "list").get("clients") or {}
+    out = []
+    for mac, c in raw.items():
+        if not c.get("online"):
+            continue
+        out.append({"name": c.get("alias") or c.get("name") or c.get("ip") or mac,
+                    "ip": c.get("ip"), "iface": c.get("iface") or "",
+                    "down": int(c.get("rx") or 0), "up": int(c.get("tx") or 0)})
+    out.sort(key=lambda c: (c["down"] + c["up"]), reverse=True)
+    return out
+
+
+def panel_devices(devs):
+    img, d = new_canvas()
+    accent = ACCENT["monitor"]
+    draw_back_header(d, f"Devices · {len(devs)}", accent)
+    if not devs:
+        centered_text(d, W / 2, 140, "No devices online", font("default_medium", 14), DIM)
+        return img
+    f_n, f_s = font("default_bold", 13), font("default_medium", 11)
+    for i, c in enumerate(devs[:DEVICE_MAX_ROWS]):
+        y0 = DEVICE_ROW_TOP + i * DEVICE_ROW_H
+        if i:
+            d.line([16, y0 - 2, W - 16, y0 - 2], fill=LINE_SOFT)
+        d.text((16, y0 + 2), truncate_to_width(d, c["name"], f_n, 120), font=f_n, fill=FG)
+        sub = " · ".join(x for x in (c["iface"], c["ip"]) if x)
+        d.text((16, y0 + 19), truncate_to_width(d, sub, f_s, 130), font=f_s, fill=DIM)
+        down, up = f"↓ {_fmt_rate(c['down'])}", f"↑ {_fmt_rate(c['up'])}"
+        d.text((W - 16 - d.textlength(down, font=f_s), y0 + 3), down, font=f_s,
+               fill=accent if c["down"] > 125000 else FG)
+        d.text((W - 16 - d.textlength(up, font=f_s), y0 + 19), up, font=f_s, fill=DIM)
+    if len(devs) > DEVICE_MAX_ROWS:
+        centered_text(d, W / 2, H - 20, f"+{len(devs) - DEVICE_MAX_ROWS} more", font("default_medium", 11), DIM)
+    return img
+
+
 # ---------- quick settings shade (fork) ----------
 # Pulled down from the top edge on any main page. Brightness writes the
 # backlight and screen_sleep.sh's saved level, so a sleep/wake keeps it.
@@ -3599,7 +3695,10 @@ def panel_networks(net, rep=None):
         d.text((36, y0 + 8), r["label"], font=font("default_bold", 15), fill=FG)
         sub = net_row_subtitle(r)
         f_sub = font("default_medium", 11)
-        if r["key"] == "wwan" and r["up"] and rep and rep.get("ssid"):
+        if r["key"] == "wwan" and r["up"] and rep and rep.get("portal"):
+            d.text((36, y0 + 28), "Login needed", font=font("default_bold", 11), fill=(240, 180, 80))
+            sub = None
+        elif r["key"] == "wwan" and r["up"] and rep and rep.get("ssid"):
             # Repeater: band beside the label, signal after the SSID, so it can
             # be compared with cellular at a glance.
             band = _band_label(rep.get("band"))
@@ -4076,8 +4175,12 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None, t
 
     # Fork: the Repeater tile is now Networks; its subtitle names the
     # connection carrying traffic right now.
-    if conn_type == "Repeater" and rep.get("connected"):
+    if conn_type == "Repeater" and rep.get("portal"):
+        net_sub = "Login needed"
+    elif conn_type == "Repeater" and rep.get("connected"):
         net_sub = rep["ssid"]
+    elif _cell_session["dev"] and cell_session_used() is not None:
+        net_sub = f"{conn_type or 'Cellular'} · {_fmt_bytes(cell_session_used())}"
     else:
         net_sub = conn_type or "Offline"
     draw_tile(d, *REPEATER_TILE,
@@ -4458,6 +4561,9 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
 
     bw_label = f"Bandwidth · {net_iface}" if net_iface else "Bandwidth"
     d.text((16, 44), bw_label, font=font("default_medium", 13), fill=DIM)
+    dev_lbl = "Devices ›"       # fork: tap the bandwidth block for the device list
+    f_dl = font("default_bold", 12)
+    d.text((W - 16 - d.textlength(dev_lbl, font=f_dl), 44), dev_lbl, font=f_dl, fill=ACCENT["monitor"])
     d.text((16, 62), "Down", font=font("default_medium", 12), fill=DIM)
     # 17pt, not 19: at 19 a three-digit "↓ 212.6 Mbps" ran into the Up column.
     f_bw = font("default_bold", 17)
@@ -4524,6 +4630,9 @@ def hit_main_monitor(x, y):
     x0, y0, x1, y1 = MONITOR_SPEEDTEST_BTN
     if x0 - 4 <= x <= x1 + 4 and y0 - 4 <= y <= y1 + 4:
         return "speedtest"
+    dx0, dy0, dx1, dy1 = MONITOR_DEVICES_ZONE
+    if dx0 <= x <= dx1 and dy0 <= y <= dy1:
+        return "devices"
     return None
 
 
@@ -6375,6 +6484,10 @@ def mode_preview(outdir):
         ("net_tethering_receive", panel_tethering(get_networks_state(), dict(get_otg_state(), role="host"))),
         ("cellular", panel_cellular((get_cellular_detail(), time.sleep(0.2), get_cellular_detail())[2])),
         ("shade", panel_shade(get_brightness_pct())),
+        ("devices", panel_devices(get_devices() or [
+            {"name": "Mac", "ip": "192.168.2.165", "iface": "5G", "down": 1800000, "up": 90000},
+            {"name": "iPhone", "ip": "192.168.2.120", "iface": "5G", "down": 42000, "up": 9000}])),
+        ("networks_portal", panel_networks(get_networks_state(), dict(rep, portal=True))),
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
@@ -6654,6 +6767,12 @@ def mode_live():
     net_detail_key = None
     cell_det = {}
     otg = {}
+    devices = []
+    last_dev_fetch = 0.0
+    last_wan_dev = get_wan_iface()     # fork: failover alerts
+    last_portal = False
+    if last_wan_dev and "rmnet" in last_wan_dev:
+        _cell_session.update(dev=last_wan_dev, start_bytes=_dev_bytes(last_wan_dev))
     wx, aq = [], []
     sms_messages = []
     wg_peers, wg_active = [], None
@@ -6676,9 +6795,9 @@ def mode_live():
     notice = {"text": None, "until": 0.0}
     NOTICE_SECONDS = 5.0
 
-    def show_notice(text):
+    def show_notice(text, seconds=NOTICE_SECONDS):
         notice["text"] = text
-        notice["until"] = time.time() + NOTICE_SECONDS
+        notice["until"] = time.time() + seconds
 
     def render_main(idx):
         img = _render_panel(idx)
@@ -7497,6 +7616,26 @@ def mode_live():
                         conn_type = get_wan_conn_type(_cell)
                         cell_signal = get_cell_signal(_cell)
                 if now - last_mon_check > 2:
+                    # Fork: banner when the connection carrying traffic changes.
+                    wan_dev = get_wan_iface()
+                    if wan_dev != last_wan_dev:
+                        if last_wan_dev and "rmnet" in last_wan_dev and not (wan_dev and "rmnet" in wan_dev):
+                            used = cell_session_used()
+                            msg = f"Back on {wan_label(wan_dev, rep)}"
+                            if used is not None:
+                                msg += f" · {_fmt_bytes(used)} on cellular"
+                            _cell_session.update(dev=None, start_bytes=None)
+                        elif wan_dev and "rmnet" in wan_dev:
+                            _cell_session.update(dev=wan_dev, start_bytes=_dev_bytes(wan_dev))
+                            msg = "Switched to Cellular"
+                        else:
+                            msg = f"Switched to {wan_label(wan_dev, rep)}"
+                        show_notice(msg, 10.0)
+                        run(["logger", "-t", "dashboard", f"WAN change {last_wan_dev} -> {wan_dev}: {msg}"])
+                        last_wan_dev = wan_dev
+                    if rep.get("portal") and not last_portal:
+                        show_notice("Hotel login needed · open any website", 12.0)
+                    last_portal = bool(rep.get("portal"))
                     net_sample, net_down, net_up = sample_bandwidth(net_sample)
                     cpu_sample, cpu_pct = sample_cpu(cpu_sample)
                     ram_pct, ram_used_gb, ram_total_gb = get_ram_stats()
@@ -7740,6 +7879,10 @@ def mode_live():
                                 new_view = "weather_detail"
                         elif name == "monitor" and zone == "speedtest":
                             new_view = "speedtest"
+                        elif name == "monitor" and zone == "devices":
+                            devices = get_devices()
+                            last_dev_fetch = now
+                            new_view = "devices"
                         elif name == "games" and zone and zone.startswith("play:"):
                             active_game = zone.split(":", 1)[1]
                             game_state = new_game_state(active_game)
@@ -7906,8 +8049,15 @@ def mode_live():
                 time.sleep(0.012)
                 continue
 
+            if view == "devices" and now - last_dev_fetch > 2:
+                devices = get_devices()
+                last_dev_fetch = now
+                sub_dirty = True
+
             if sub_dirty:
-                if view == "networks":
+                if view == "devices":
+                    img = panel_devices(devices)
+                elif view == "networks":
                     img = panel_networks(net, rep)
                 elif view == "net_detail":
                     img = (panel_tethering(net, otg) if net_detail_key == "tethering"
