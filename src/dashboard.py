@@ -3281,7 +3281,7 @@ CLOCK_LEFT_ZONE = (0, 34, W // 2, 142)
 CLOCK_RIGHT_ZONE = (W // 2, 34, W, 142)
 REPEATER_TILE = (8, 150, 116, 244)
 MORE_TILE = (124, 150, 232, 244)
-SMS_TILE = (8, 250, 232, 296)
+STATUS_BADGES = (8, 250, 232, 296)   # fork: badge grid where the Messages tile was
 
 FX_TOP_ZONE = (34, 122)
 FX_BOTTOM_ZONE = (128, 216)
@@ -3336,7 +3336,7 @@ def travel_installed():
 
 def travel_status_empty(installed=False):
     return {"installed": installed, "speedify": None, "ranch": False,
-            "tunnel": None, "handshake_s": None}
+            "tunnel": None, "handshake_s": None, "tailscale": False}
 
 
 def _speedify_json(*args, timeout=10):
@@ -3352,8 +3352,15 @@ def get_speedify_state():
     return j.get("state") if isinstance(j, dict) else None
 
 
+def get_tailscale_up():
+    """Tailscale counts as up when tailscale0 holds a 100.x tailnet address."""
+    out = run(["ip", "-4", "addr", "show", "dev", "tailscale0"], timeout=3)
+    return "inet 100." in out
+
+
 def get_travel_status():
     st = travel_status_empty(travel_installed())
+    st["tailscale"] = get_tailscale_up()
     if not st["installed"]:
         return st
     st["speedify"] = get_speedify_state()
@@ -3463,7 +3470,57 @@ PANEL_NAMES = ["clock", "sim", "monitor", "travel"]
 
 # ---------- main panels ----------
 
-def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None):
+BADGE_ON = (70, 240, 170)
+BADGE_RED = (240, 90, 90)
+BADGE_AMBER = (240, 180, 80)
+
+
+def status_badges(travel, wg_active):
+    """[(label, state)] for the Home badge grid; state is on/off/warn/bad."""
+    travel = travel or {}
+    sp = travel.get("speedify")
+    if sp == "CONNECTED":
+        sp_state = "on"
+    elif sp in ("CONNECTING", "AUTO_CONNECTING"):
+        sp_state = "warn"
+    else:
+        sp_state = "off"
+    if travel.get("ranch"):
+        ranch_state = "on" if travel.get("tunnel") else "bad"
+    else:
+        ranch_state = "off"
+    return [("Speedify", sp_state), ("Home IP", ranch_state),
+            ("WireGuard", "on" if wg_active else "off"),
+            ("Tailscale", "on" if travel.get("tailscale") else "off")]
+
+
+def draw_status_badges(d, travel, wg_active):
+    """Glass pills: a coloured outline, text and glowing dot carry the state
+    (mint = on, amber = connecting, red = problem); off stays dim glass."""
+    x0, y0, x1, y1 = STATUS_BADGES
+    gap = 6
+    bw = (x1 - x0 - gap) / 2
+    bh = (y1 - y0 - gap) / 2
+    f = font("default_bold", 12)
+    for i, (label, state) in enumerate(status_badges(travel, wg_active)):
+        r, c = divmod(i, 2)
+        bx0 = x0 + c * (bw + gap)
+        by0 = y0 + r * (bh + gap)
+        box = [bx0, by0, bx0 + bw, by0 + bh]
+        col = {"on": BADGE_ON, "warn": BADGE_AMBER, "bad": BADGE_RED}.get(state)
+        glass(d, box, radius=bh / 2, outline=col or SURFACE_EDGE, width=2 if col else 1)
+        dot_x, cy = bx0 + 12, by0 + bh / 2
+        if col:
+            halo = _mix(col, SURFACE, 0.55)
+            d.ellipse([dot_x - 5, cy - 5, dot_x + 5, cy + 5], fill=halo)
+            d.ellipse([dot_x - 3, cy - 3, dot_x + 3, cy + 3], fill=col)
+        else:
+            d.ellipse([dot_x - 3, cy - 3, dot_x + 3, cy + 3], fill=OFF)
+        tb = d.textbbox((0, 0), label, font=f)
+        d.text((dot_x + 10, cy - (tb[3] - tb[1]) / 2 - tb[1]), label, font=f, fill=FG if col else DIM)
+
+
+def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None, travel=None, wg_active=None):
     from zoneinfo import ZoneInfo
     img, d = new_canvas()
     draw_header(d, "HOME", ACCENT["clock"], conn_type, cell_signal)
@@ -3491,20 +3548,7 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None):
               lambda dd, cx, cy, r, ac: _icon_settings_gear(dd, cx, cy, r, ac),
               "More", "Settings", ACCENT["clock"])
 
-    sx0, sy0, sx1, sy1 = SMS_TILE
-    glass(d, [sx0, sy0, sx1, sy1], radius=10, outline=SURFACE_EDGE)
-    _icon_sms(d, sx0 + 28, (sy0 + sy1) / 2, 13, ACCENT["clock"])
-    messages = sms_messages or []
-    if messages:
-        latest = messages[0]
-        d.text((sx0 + 52, sy0 + 9), "Messages", font=font("default_bold", 14), fill=FG)
-        sub = f"{latest['from']}: {latest['body'].replace(chr(10), ' ')}"
-        f_sub = font("default_cn_medium", 11)
-        sub = truncate_to_width(d, sub, f_sub, (sx1 - sx0) - 64)
-        d.text((sx0 + 52, sy0 + 27), sub, font=f_sub, fill=DIM)
-    else:
-        d.text((sx0 + 52, sy0 + 9), "Messages", font=font("default_bold", 14), fill=FG)
-        d.text((sx0 + 52, sy0 + 27), "No messages", font=font("default_medium", 11), fill=DIM)
+    draw_status_badges(d, travel, wg_active)
 
     draw_page_dots(d, PANEL_NAMES.index("clock"))
     return img
@@ -4316,13 +4360,14 @@ def hit_confirm(x, y):
 
 MORE_WIFI24_TOGGLE = (176, 37, 224, 63)
 MORE_WIFI56_SEG = (16, 104, 224, 128)
+MORE_SMS_RECT = (16, 166, W - 16, 216)   # fork: Messages moved here from Home
 MORE_CLOCK_STYLE_SEG = (16, 184, 224, 208)
 MORE_RETURN_STOCK_RECT = (16, 232, W - 16, 266)
 MORE_REBOOT_RECT = (16, 272, 116, 306)
 MORE_SHUTDOWN_RECT = (124, 272, W - 16, 306)
 
 
-def panel_more(wifi24, wifi_band, clock_style, wifi56_disabled_idx=None):
+def panel_more(wifi24, wifi_band, clock_style, wifi56_disabled_idx=None, sms_messages=None):
     img, d = new_canvas()
     draw_back_header(d, "More", ACCENT["clock"])
 
@@ -4347,7 +4392,20 @@ def panel_more(wifi24, wifi_band, clock_style, wifi56_disabled_idx=None):
 
     d.line([16, 150, W - 16, 150], fill=LINE)
 
-    # Fork: Clock Style row removed (digital clocks are fixed via config).
+    # Fork: Clock Style row removed (digital clocks are fixed via config);
+    # Messages lives here now, moved off Home for the status badges.
+    sx0, sy0, sx1, sy1 = MORE_SMS_RECT
+    glass(d, [sx0, sy0, sx1, sy1], radius=10, outline=SURFACE_EDGE)
+    _icon_sms(d, sx0 + 26, (sy0 + sy1) / 2, 12, ACCENT["clock"])
+    d.text((sx0 + 48, sy0 + 8), "Messages  ›", font=font("default_bold", 14), fill=FG)
+    messages = sms_messages or []
+    if messages:
+        latest = messages[0]
+        sub = f"{latest['from']}: {latest['body'].replace(chr(10), ' ')}"
+        f_sub = font("default_cn_medium", 11)
+        d.text((sx0 + 48, sy0 + 27), truncate_to_width(d, sub, f_sub, (sx1 - sx0) - 58), font=f_sub, fill=DIM)
+    else:
+        d.text((sx0 + 48, sy0 + 27), "No messages", font=font("default_medium", 11), fill=DIM)
 
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=ACCENT["clock"], width=2)
@@ -4375,6 +4433,9 @@ def hit_more(x, y, wifi56_disabled_idx=None):
         if idx == wifi56_disabled_idx:
             return None
         return ["wifi_5g", "wifi_off", "wifi_6g"][idx]
+    mx0, my0, mx1, my1 = MORE_SMS_RECT
+    if mx0 <= x <= mx1 and my0 <= y <= my1:
+        return "sms"
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     if rx0 <= x <= rx1 and ry0 <= y <= ry1:
         return "return_stock"
@@ -5586,9 +5647,9 @@ def hit_main_clock(x, y):
     mx0, my0, mx1, my1 = MORE_TILE
     if mx0 <= x <= mx1 and my0 <= y <= my1:
         return "more"
-    sx0, sy0, sx1, sy1 = SMS_TILE
+    sx0, sy0, sx1, sy1 = STATUS_BADGES
     if sx0 <= x <= sx1 and sy0 <= y <= sy1:
-        return "sms"
+        return "status"
     lx0, ly0, lx1, ly1 = CLOCK_LEFT_ZONE
     if lx0 <= x < lx1 and ly0 <= y < ly1:
         return "city_left"
@@ -5740,6 +5801,7 @@ def mode_preview(outdir):
     sms_messages = get_sms_messages()
     wg_peers = get_wireguard_peers()
     wg_active = get_wireguard_active()
+    travel = get_travel_status()
     rep = get_repeater_status()
     rep_networks = repeater_scan()
     sysinfo = get_system_info()
@@ -5758,8 +5820,9 @@ def mode_preview(outdir):
     cell_signal = get_cell_signal(_cell_info)
     cfg_digital = dict(cfg, clock_style="digital")
     screens = [
-        ("clock", panel_clock(cfg, rep, conn_type, cell_signal, sms_messages)),
-        ("clock_digital", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages)),
+        ("clock", panel_clock(cfg, rep, conn_type, cell_signal, sms_messages, travel, wg_active)),
+        ("clock_digital", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages, travel, wg_active)),
+        ("clock_badges_demo", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages, dict(travel, speedify="CONNECTED", ranch=True, tunnel=False, tailscale=True), "peer_demo")),
         ("sim", panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info)),
         ("sim_confirm", panel_confirm("Mobile data", "Turn mobile data off? SMS and calls still work. Internet runs over cellular right now, so the router will go offline.", ACCENT["sim"], yes_label="Turn off", danger=True)),
         ("sim_verifying", draw_loading_overlay(panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info), "Registering… 7s", 120, ACCENT["sim"])),
@@ -5779,7 +5842,7 @@ def mode_preview(outdir):
         ("sms", panel_sms(sms_messages or _DEMO_SMS_MESSAGES)),
         ("sms_detail", panel_sms_detail((sms_messages or _DEMO_SMS_MESSAGES)[0])),
         ("wireguard", panel_wireguard(wg_peers, wg_active)),
-        ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))),
+        ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
         ("confirm_long", panel_confirm("Stock UI", "Hand the screen back to the GL.iNet UI?", ACCENT["clock"], yes_label="Switch")),
@@ -6095,7 +6158,7 @@ def mode_live():
     def _render_panel(idx):
         name = PANEL_NAMES[idx]
         if name == "clock":
-            return panel_clock(cfg, rep, conn_type, cell_signal, sms_messages)
+            return panel_clock(cfg, rep, conn_type, cell_signal, sms_messages, travel, wg_active)
         elif name == "fx":
             return panel_fx(cfg, fx, fx_range, conn_type, cell_signal)
         elif name == "sim":
@@ -6426,10 +6489,8 @@ def mode_live():
             is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
                       and abs(final_dy) <= TAP_JITTER_PX)
             if is_tap and hit_back(down_y):
-                view = "main"
-                cur_img = render_main(panel_idx)
-                write_frame(cur_img)
-                last_draw = now
+                view = "more"          # fork: the inbox opens from More now
+                sub_dirty = True
             elif is_tap:
                 idx = hit_sms(down_y, len(sms_messages), picker_scroll_base)
                 if idx is not None:
@@ -6943,10 +7004,11 @@ def mode_live():
                             wifi24 = get_wifi_radio_state("wifi2g")
                             wifi_band = get_wifi_band_state()
                             rep = get_repeater_status()
-                        elif name == "clock" and zone == "sms":
-                            new_view = "sms"
-                            picker_scroll_base = 0
-                            sms_messages = get_sms_messages()
+                        elif name == "clock" and zone == "status":
+                            panel_idx = PANEL_NAMES.index("travel")
+                            cur_img = render_main(panel_idx)
+                            write_frame(cur_img)
+                            last_draw = now
                         elif name == "fx" and zone == "top_from":
                             new_view, fx_edit_side = "fx_top", "from"
                             picker_scroll_base = 0
@@ -7221,7 +7283,7 @@ def mode_live():
 
             if sub_dirty:
                 if view == "more":
-                    img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))
+                    img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)
                 elif view == "confirm":
                     img = panel_confirm(confirm_title, confirm_message, confirm_accent(),
                                         yes_label=confirm_yes_label, danger=confirm_danger)
@@ -7374,8 +7436,13 @@ def mode_live():
                     # not this screen, so the spinner's dimmed background
                     # needs its own fresh render (same as the scroll
                     # pickers' on_select(key, base_img) pattern).
-                    more_img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep))
-                    if action == "wifi24":
+                    more_img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)
+                    if action == "sms":
+                        picker_scroll_base = 0
+                        sms_messages = get_sms_messages()
+                        view = "sms"
+                        sub_dirty = True
+                    elif action == "wifi24":
                         # request_wifi_reload's ~8-10s reload used to be
                         # totally invisible: the toggle flipped the
                         # instant the tap landed and never looked back,
