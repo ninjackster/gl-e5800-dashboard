@@ -3327,6 +3327,97 @@ WEATHER_CITY_ZONE = (34, 66)
 
 PICKER_TOP, PICKER_BOTTOM = 38, 316
 
+
+# ---------- quick settings shade (fork) ----------
+# Pulled down from the top edge on any main page. Brightness writes the
+# backlight and screen_sleep.sh's saved level, so a sleep/wake keeps it.
+BL_DIR = "/sys/class/backlight/soc:backlight"
+BL_SAVED = "/root/dashboard/.backlight_saved"
+SHADE_PULL_ZONE = 40          # a drag must start in the header strip
+SHADE_OPEN_PX = 90            # how far to pull before it opens
+SHADE_SLIDER = (40, 78, W - 48, 98)
+SHADE_SCREEN_OFF = (16, 140, W - 16, 176)
+SHADE_HANDLE_Y = H - 34
+BRIGHTNESS_MIN_PCT = 8
+
+
+def get_brightness_pct():
+    try:
+        cur = int(_read_sys(f"{BL_DIR}/brightness") or 0)
+        mx = int(_read_sys(f"{BL_DIR}/max_brightness") or 0)
+        return max(0, min(100, round(cur * 100 / mx))) if mx else None
+    except ValueError:
+        return None
+
+
+def set_brightness_pct(pct):
+    pct = max(BRIGHTNESS_MIN_PCT, min(100, int(pct)))
+    try:
+        mx = int(_read_sys(f"{BL_DIR}/max_brightness") or 0)
+        if not mx:
+            return None
+        level = max(1, round(mx * pct / 100))
+        with open(f"{BL_DIR}/brightness", "w") as f:
+            f.write(str(level))
+        with open(BL_SAVED, "w") as f:
+            f.write(str(level))
+        return pct
+    except Exception:
+        return None
+
+
+def _icon_sun_small(d, cx, cy, r, color):
+    d.ellipse([cx - r * 0.45, cy - r * 0.45, cx + r * 0.45, cy + r * 0.45], fill=color)
+    for i in range(8):
+        a = math.radians(i * 45)
+        d.line([cx + math.cos(a) * r * 0.7, cy + math.sin(a) * r * 0.7,
+                cx + math.cos(a) * r, cy + math.sin(a) * r], fill=color, width=2)
+
+
+def panel_shade(pct):
+    img, d = new_canvas()
+    accent = ACCENT["clock"]
+    glass(d, [0, 0, W, H], radius=0, dim=0.55)
+    d.text((16, 12), "Quick settings", font=font("default_bold", 17), fill=FG)
+    d.text((16, 50), "Brightness", font=font("default_medium", 14), fill=FG)
+    pct_txt = f"{pct}%" if pct is not None else "—"
+    f_p = font("default_bold", 14)
+    d.text((W - 16 - d.textlength(pct_txt, font=f_p), 50), pct_txt, font=f_p, fill=accent)
+    x0, y0, x1, y1 = SHADE_SLIDER
+    cy = (y0 + y1) / 2
+    _icon_sun_small(d, 22, cy, 6, DIM)
+    _icon_sun_small(d, W - 22, cy, 9, FG)
+    d.rounded_rectangle([x0, cy - 4, x1, cy + 4], radius=4, fill=TRACK)
+    if pct is not None:
+        kx = x0 + (x1 - x0) * pct / 100
+        d.rounded_rectangle([x0, cy - 4, kx, cy + 4], radius=4, fill=accent)
+        d.ellipse([kx - 10, cy - 10, kx + 10, cy + 10], fill=(255, 255, 255))
+    d.line([16, 122, W - 16, 122], fill=LINE)
+    bx0, by0, bx1, by1 = SHADE_SCREEN_OFF
+    glass(d, [bx0, by0, bx1, by1], radius=10, outline=SURFACE_EDGE)
+    centered_text_box(d, bx0, by0, bx1, by1, "Screen off  ·  power button wakes", font("default_medium", 13), FG)
+    d.rounded_rectangle([W / 2 - 22, SHADE_HANDLE_Y + 14, W / 2 + 22, SHADE_HANDLE_Y + 18], radius=2, fill=DIM)
+    centered_text(d, W / 2, SHADE_HANDLE_Y - 2, "swipe up to close", font("default_medium", 10), DIM)
+    return img
+
+
+def shade_pct_at(x):
+    x0, _, x1, _ = SHADE_SLIDER
+    return round(max(0, min(1, (x - x0) / (x1 - x0))) * 100)
+
+
+def hit_shade(x, y):
+    x0, y0, x1, y1 = SHADE_SLIDER
+    if y0 - 16 <= y <= y1 + 16 and x0 - 24 <= x <= x1 + 24:
+        return "slider"
+    bx0, by0, bx1, by1 = SHADE_SCREEN_OFF
+    if bx0 <= x <= bx1 and by0 <= y <= by1:
+        return "screen_off"
+    if y >= SHADE_HANDLE_Y - 10:
+        return "close"
+    return None
+
+
 # ---------- networks (fork) ----------
 #
 # Home's "Networks" tile: every WAN the Mudi can use, in failover priority
@@ -6283,6 +6374,7 @@ def mode_preview(outdir):
         ("net_tethering", panel_tethering(get_networks_state(), get_otg_state())),
         ("net_tethering_receive", panel_tethering(get_networks_state(), dict(get_otg_state(), role="host"))),
         ("cellular", panel_cellular((get_cellular_detail(), time.sleep(0.2), get_cellular_detail())[2])),
+        ("shade", panel_shade(get_brightness_pct())),
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
@@ -6630,6 +6722,9 @@ def mode_live():
     last_draw = time.time()
 
     state = "idle"  # idle | dragging | animating  (main-carousel only)
+    shade_pull = False      # fork: pulling the quick-settings shade down
+    shade_img = None
+    shade_pct = None
     neighbor_img = None
     neighbor_on_right = True
     drag_strip = None
@@ -6910,6 +7005,50 @@ def mode_live():
             spin_phase = int(now * 240) % 360
             write_frame(panel_repeater(rep, rep_networks, picker_scroll_base, connecting_ssid,
                                        spin_phase, error=connect_error))
+            sub_dirty = False
+
+    def handle_shade(now):
+        """Quick-settings shade: live brightness drag, Screen off, close by
+        swiping up or tapping the handle."""
+        nonlocal view, sub_dirty, cur_img, last_draw, shade_pct
+        with touch_state.lock:
+            active = touch_state.active
+            dy, dx = touch_state.dy, touch_state.dx
+            down_x, down_y = touch_state.down_x, touch_state.down_y
+            have_pos = touch_state.have_pos
+            released = touch_state.release_pending
+            release_dx, release_dy = touch_state.release_dx, touch_state.release_dy
+            touch_state.release_pending = False
+
+        def close():
+            nonlocal view, cur_img, last_draw
+            view = "main"
+            cur_img = render_main(panel_idx)
+            write_frame(cur_img)
+            last_draw = now
+
+        if active and have_pos and hit_shade(down_x, down_y) == "slider":
+            want = shade_pct_at(down_x + dx)
+            if want != shade_pct:
+                got = set_brightness_pct(want)
+                shade_pct = got if got is not None else shade_pct
+                write_frame(panel_shade(shade_pct))
+        elif released:
+            is_tap = (have_pos and abs(release_dx) <= TAP_JITTER_PX
+                      and abs(release_dy) <= TAP_JITTER_PX)
+            zone = hit_shade(down_x, down_y) if have_pos else None
+            if not is_tap and release_dy < -40 and zone != "slider":
+                close()
+            elif is_tap and zone == "close":
+                close()
+            elif is_tap and zone == "screen_off":
+                close()
+                run(["/root/dashboard/screen_sleep.sh", "off"], timeout=5)
+            elif zone == "slider":
+                write_frame(panel_shade(shade_pct))
+        elif sub_dirty:
+            shade_pct = get_brightness_pct()
+            write_frame(panel_shade(shade_pct))
             sub_dirty = False
 
     def handle_sms_scroll(now):
@@ -7386,6 +7525,31 @@ def mode_live():
                     have_pos = touch_state.have_pos
                     touch_state.release_pending = False
 
+                # Fork: a mostly-vertical drag that starts in the header strip
+                # pulls the quick-settings shade down instead of paging.
+                if shade_pull or (down_y <= SHADE_PULL_ZONE and dy > TAP_JITTER_PX
+                                  and abs(dy) > abs(dx) and drag_strip is None):
+                    if not shade_pull:
+                        shade_pull = True
+                        shade_img = panel_shade(get_brightness_pct())
+                    if released or not active:
+                        shade_pull = False
+                        state = "idle"
+                        neighbor_img = None
+                        drag_strip = None
+                        if (release_dy if released else dy) >= SHADE_OPEN_PX:
+                            view = "shade"
+                            sub_dirty = True
+                        else:
+                            write_frame(cur_img)
+                    else:
+                        pull = max(0, min(H, int(dy)))
+                        frame = cur_img.copy()
+                        frame.paste(shade_img.crop((0, H - pull, W, H)), (0, 0))
+                        write_frame(frame)
+                    time.sleep(0.012)
+                    continue
+
                 if neighbor_img is None or (neighbor_on_right and dx > TAP_JITTER_PX) or \
                    (not neighbor_on_right and dx < -TAP_JITTER_PX):
                     if dx < 0:
@@ -7714,6 +7878,11 @@ def mode_live():
 
             if view == "repeater":
                 handle_repeater_scroll(now)
+                time.sleep(0.012)
+                continue
+
+            if view == "shade":
+                handle_shade(now)
                 time.sleep(0.012)
                 continue
 
