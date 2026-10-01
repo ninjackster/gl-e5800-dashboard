@@ -2762,11 +2762,12 @@ def draw_analog_clock(d, cx, cy, r, dt, accent):
     d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=accent)
 
 
-def draw_digital_clock(d, cx, cy, dt, accent):
-    f_time = font("default_mono_medium", 30)
+def draw_digital_clock(d, cx, cy, dt, accent, show_seconds=True, size=30):
+    f_time = font("default_mono_medium", size)
     centered_text(d, cx, cy - 20, dt.strftime("%H:%M"), f_time, FG)
-    f_sec = font("default_medium", 13)
-    centered_text(d, cx, cy + 14, dt.strftime(":%S"), f_sec, accent)
+    if show_seconds:
+        f_sec = font("default_medium", 13)
+        centered_text(d, cx, cy + 14, dt.strftime(":%S"), f_sec, accent)
 
 
 def _draw_aa(d, x0, y0, w, h, color, draw_fn, scale=4):
@@ -3277,11 +3278,13 @@ def draw_sparkline(d, x, y, w, h, points, color):
 
 # ---------- layout constants (shared by drawing and hit-testing) ----------
 
-CLOCK_LEFT_ZONE = (0, 34, W // 2, 142)
-CLOCK_RIGHT_ZONE = (W // 2, 34, W, 142)
-REPEATER_TILE = (8, 150, 116, 244)
-MORE_TILE = (124, 150, 232, 244)
-STATUS_BADGES = (8, 250, 232, 296)   # fork: badge grid where the Messages tile was
+# Fork: no seconds on the clocks, so the clock block is shorter and the
+# tiles and badge grid move up.
+CLOCK_LEFT_ZONE = (0, 34, W // 2, 118)
+CLOCK_RIGHT_ZONE = (W // 2, 34, W, 118)
+REPEATER_TILE = (8, 126, 116, 218)
+MORE_TILE = (124, 126, 232, 218)
+STATUS_BADGES = (8, 226, 232, 296)   # fork: badge grid where the Messages tile was
 
 FX_TOP_ZONE = (34, 122)
 FX_BOTTOM_ZONE = (128, 216)
@@ -3529,22 +3532,22 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None, t
     dt_r = datetime.now(ZoneInfo(tz_r))
 
     if cfg.get("clock_style") == "digital":
-        draw_digital_clock(d, W / 4, 72, dt_l, ACCENT["clock"])
-        draw_digital_clock(d, W * 3 / 4, 72, dt_r, ACCENT["clock"])
+        draw_digital_clock(d, W / 4, 64, dt_l, ACCENT["clock"], show_seconds=False, size=34)
+        draw_digital_clock(d, W * 3 / 4, 64, dt_r, ACCENT["clock"], show_seconds=False, size=34)
     else:
         draw_analog_clock(d, W / 4, 72, 30, dt_l, ACCENT["clock"])
         draw_analog_clock(d, W * 3 / 4, 72, 30, dt_r, ACCENT["clock"])
-    centered_text(d, W / 4, 106, f"{city_name(tz_l)}  ›", font("default_medium", 12), DIM)
-    centered_text(d, W * 3 / 4, 106, f"{city_name(tz_r)}  ›", font("default_medium", 12), DIM)
-    centered_text(d, W / 2, 122, dt_l.strftime("%a %d %b"), font("default_medium", 12), DIM)
+    centered_text(d, W / 4, 86, f"{city_name(tz_l)}  ›", font("default_medium", 12), DIM)
+    centered_text(d, W * 3 / 4, 86, f"{city_name(tz_r)}  ›", font("default_medium", 12), DIM)
+    centered_text(d, W / 2, 102, dt_l.strftime("%a %d %b"), font("default_medium", 12), DIM)
 
-    d.line([16, 142, W - 16, 142], fill=(34, 38, 48))
+    d.line([16, 120, W - 16, 120], fill=LINE)
 
     rep_sub = rep["ssid"] if rep["connected"] else "Not connected"
-    draw_tile(d, 8, 150, 116, 244,
+    draw_tile(d, *REPEATER_TILE,
               lambda dd, cx, cy, r, ac: _icon_wifi_signal(dd, cx, cy, r, ac),
               "Repeater", rep_sub, ACCENT["clock"])
-    draw_tile(d, 124, 150, 232, 244,
+    draw_tile(d, *MORE_TILE,
               lambda dd, cx, cy, r, ac: _icon_settings_gear(dd, cx, cy, r, ac),
               "More", "Settings", ACCENT["clock"])
 
