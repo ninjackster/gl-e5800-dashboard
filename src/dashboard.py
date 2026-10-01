@@ -3602,6 +3602,105 @@ def hit_cellular(x, y):
     return None
 
 
+
+# USB-C tethering direction (fork). The Type-C port is either "host" (the
+# Mudi RECEIVES internet from a tethered phone -> the tethering WAN) or
+# "device" (the Mudi GIVES its internet to a laptop over USB as rndis0).
+# Switched through GL's own otg RPC, the same call the web UI makes.
+_GL_OTG_RPC = "/usr/lib/oui-httpd/rpc/otg"
+_GL_TETHER_RPC = "/usr/lib/oui-httpd/rpc/tethering"
+OTG_MODE_SEG = (16, 62, W - 16, 88)
+TETHER_TOGGLE_RECT = (172, 104, 218, 126)
+
+
+def get_otg_state():
+    ok, cfg = gl_lua_rpc(_GL_OTG_RPC, "get_config", {}, timeout=20)
+    role = cfg.get("data_role") if ok and isinstance(cfg, dict) else None
+    ok2, ts = gl_lua_rpc(_GL_TETHER_RPC, "get_status", {}, timeout=20)
+    devices = (ts or {}).get("devices") if ok2 and isinstance(ts, dict) else {}
+    return {"role": role, "cfg": cfg if ok else {}, "phone_devices": devices or {},
+            "rndis_up": _read_sys("/sys/class/net/rndis0/operstate") == "up"}
+
+
+def set_otg_role(role):
+    """role 'host' (receive) or 'device' (give); verified by reading back."""
+    ok, cfg = gl_lua_rpc(_GL_OTG_RPC, "get_config", {}, timeout=20)
+    if not ok or not isinstance(cfg, dict):
+        return False
+    params = {k: v for k, v in cfg.items() if k not in ("status", "dual_role")}
+    params["data_role"] = role
+    gl_lua_rpc(_GL_OTG_RPC, "set_config", params, timeout=30)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        ok, cfg = gl_lua_rpc(_GL_OTG_RPC, "get_config", {}, timeout=20)
+        if ok and isinstance(cfg, dict) and cfg.get("data_role") == role:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def panel_tethering(net, otg):
+    r = next((r for r in net["rows"] if r["key"] == "tethering"), None) or {}
+    img, d = new_canvas()
+    accent = ACCENT["clock"]
+    draw_back_header(d, "Tethering", accent)
+    d.text((16, 42), "USB-C mode", font=font("default_medium", 13), fill=DIM)
+    role = (otg or {}).get("role")
+    sx0, sy0, sx1, sy1 = OTG_MODE_SEG
+    sel = 0 if role == "host" else 1 if role == "device" else -1
+    if sel < 0:
+        d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=(sy1 - sy0) / 2, outline=SURFACE_EDGE, width=2)
+        centered_text_box(d, sx0, sy0, sx1, sy1, "Mode unknown", font("default_medium", 13), DIM)
+    else:
+        draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Receive", "Give"], sel, accent)
+    d.line([16, 96, W - 16, 96], fill=LINE)
+    f_t, f_v = font("default_medium", 12), font("default_medium", 12)
+
+    def kv(y, k, v):
+        d.text((16, y), k, font=f_t, fill=DIM)
+        v = truncate_to_width(d, v, f_v, W - 110)
+        d.text((W - 16 - d.textlength(v, font=f_v), y), v, font=f_v, fill=FG)
+
+    if role == "host":
+        if r.get("present") or r.get("up"):
+            d.text((16, 106), "Phone internet", font=font("default_medium", 15), fill=FG)
+            tx0, ty0, tx1, ty1 = TETHER_TOGGLE_RECT
+            draw_toggle(d, tx0, ty0, r.get("up"), accent, w=tx1 - tx0, h=ty1 - ty0)
+            y = 140
+            for k, v in (("Status", ("Up" if r.get("up") else "Down") + (" · active" if r.get("active") else "")),
+                         ("IP", r.get("ip") or "—"), ("Gateway", r.get("gateway") or "—"),
+                         ("DNS", ", ".join((r.get("dns") or [])[:2]) or "—"),
+                         ("Uptime", _fmt_uptime(r.get("uptime"))), ("Device", r.get("device") or "—")):
+                kv(y, k, v)
+                y += 24
+        else:
+            msg = ("Receiving: plug your phone into USB-C, then turn on Personal Hotspot (iPhone) "
+                   "or USB tethering (Android). It becomes a WAN in the failover order.")
+            for i, line in enumerate(wrap_text_to_lines(d, msg, font("default_medium", 13), W - 36)):
+                centered_text(d, W / 2, 116 + i * 19, line, font("default_medium", 13), DIM)
+    elif role == "device":
+        laptop = (otg or {}).get("rndis_up")
+        d.text((16, 106), "Sharing over USB-C", font=font("default_medium", 15), fill=FG)
+        kv(134, "Laptop", "Connected" if laptop else "Not connected")
+        kv(158, "Mudi address", "169.254.20.1")
+        msg = ("Giving: plug a laptop into USB-C. It shows up as a USB network adapter "
+               "and uses the Mudi's internet, VPNs and Speedify included.")
+        for i, line in enumerate(wrap_text_to_lines(d, msg, font("default_medium", 12), W - 36)):
+            centered_text(d, W / 2, 196 + i * 17, line, font("default_medium", 12), DIM)
+    centered_text(d, W / 2, H - 22, "Switching mode drops what's plugged in", font("default_medium", 10), DIM)
+    return img
+
+
+def hit_tethering(x, y, otg):
+    sx0, sy0, sx1, sy1 = OTG_MODE_SEG
+    if sx0 <= x <= sx1 and sy0 - 4 <= y <= sy1 + 4:
+        return "otg_host" if x < (sx0 + sx1) / 2 else "otg_device"
+    tx0, ty0, tx1, ty1 = TETHER_TOGGLE_RECT
+    if (otg or {}).get("role") == "host" and tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
+        return "toggle"
+    return None
+
+
 def _icon_globe(d, cx, cy, r, color):
     w = max(2, int(r * 0.13))
     d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=w)
@@ -6145,7 +6244,8 @@ def mode_preview(outdir):
         ("wireguard", panel_wireguard(wg_peers, wg_active)),
         ("networks", panel_networks(get_networks_state(), rep)),
         ("net_wan", panel_net_detail(get_networks_state(), "wan")),
-        ("net_tethering", panel_net_detail(get_networks_state(), "tethering")),
+        ("net_tethering", panel_tethering(get_networks_state(), get_otg_state())),
+        ("net_tethering_receive", panel_tethering(get_networks_state(), dict(get_otg_state(), role="host"))),
         ("cellular", panel_cellular((get_cellular_detail(), time.sleep(0.2), get_cellular_detail())[2])),
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)),
         ("repeater", panel_repeater(rep, rep_networks)),
@@ -6425,6 +6525,7 @@ def mode_live():
     net = {"rows": [], "health_checks": False}
     net_detail_key = None
     cell_det = {}
+    otg = {}
     wx, aq = [], []
     sms_messages = []
     wg_peers, wg_active = [], None
@@ -7604,7 +7705,8 @@ def mode_live():
                 if view == "networks":
                     img = panel_networks(net, rep)
                 elif view == "net_detail":
-                    img = panel_net_detail(net, net_detail_key)
+                    img = (panel_tethering(net, otg) if net_detail_key == "tethering"
+                           else panel_net_detail(net, net_detail_key))
                 elif view == "cellular":
                     img = panel_cellular(cell_det)
                 elif view == "more":
@@ -7664,6 +7766,17 @@ def mode_live():
                         cur_img = render_main(panel_idx)
                         write_frame(cur_img)
                         last_draw = time.time()
+                    elif confirm_action.startswith("otg_role:"):
+                        role = confirm_action.split(":")[1]
+                        base = panel_tethering(net, otg)
+                        ok = run_with_spinner(base, "Switching USB-C…", lambda: set_otg_role(role),
+                                              ACCENT["clock"], min_visible=0.8)
+                        otg = get_otg_state()
+                        net = get_networks_state()
+                        if not ok:
+                            show_notice("USB-C mode didn't change")
+                        view = confirm_return_view
+                        sub_dirty = True
                     elif confirm_action.startswith("net_toggle:") or confirm_action == "cell_reconnect":
                         if confirm_action == "cell_reconnect":
                             base = panel_cellular(cell_det)
@@ -7784,9 +7897,32 @@ def mode_live():
                         sub_dirty = True
                     elif key:
                         net_detail_key = key
+                        if key == "tethering":
+                            otg = run_with_spinner(panel_networks(net, rep), "Loading…", get_otg_state,
+                                                   ACCENT["clock"]) or {}
                         view = "net_detail"
                         sub_dirty = True
-                elif is_tap and view == "net_detail" and hit_net_detail(down_x, down_y) == "toggle":
+                elif (is_tap and view == "net_detail" and net_detail_key == "tethering"
+                      and hit_tethering(down_x, down_y, otg) in ("otg_host", "otg_device")):
+                    want_role = "host" if hit_tethering(down_x, down_y, otg) == "otg_host" else "device"
+                    if otg.get("role") != want_role:
+                        confirm_title = "USB-C mode"
+                        confirm_message = ("Switch USB-C to Receive? The Mudi takes internet from a tethered phone; "
+                                           "a laptop plugged in now disconnects." if want_role == "host" else
+                                           "Switch USB-C to Give? The Mudi shares its internet with a laptop; "
+                                           "a tethered phone disconnects.")
+                        confirm_yes_label = "Switch"
+                        confirm_danger = False
+                        confirm_action = f"otg_role:{want_role}"
+                        confirm_return_view = "net_detail"
+                        view = "confirm"
+                        sub_dirty = True
+                elif (is_tap and view == "net_detail" and net_detail_key == "tethering"
+                      and hit_tethering(down_x, down_y, otg) != "toggle"):
+                    pass
+                elif is_tap and view == "net_detail" and (
+                        hit_tethering(down_x, down_y, otg) == "toggle" if net_detail_key == "tethering"
+                        else hit_net_detail(down_x, down_y) == "toggle"):
                     r = next((r for r in net["rows"] if r["key"] == net_detail_key), None)
                     if r and (r["present"] or r["up"]):
                         want = not r["up"]
