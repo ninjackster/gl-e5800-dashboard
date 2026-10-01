@@ -40,19 +40,78 @@ FX_CACHE = STATE_DIR / "fx_cache.json"
 CONFIG_FILE = STATE_DIR / "config.json"
 GAME_SCORES_FILE = STATE_DIR / "game_scores.json"
 
-BG = (11, 18, 32)
-FG = (230, 235, 245)
-DIM = (120, 130, 150)
-ACCENT = {
-    "clock": (86, 182, 255),
-    "fx": (255, 190, 90),
-    "sim": (110, 220, 150),
-    "openclash": (200, 140, 255),
-    "weather": (90, 214, 200),
-    "monitor": (235, 120, 160),
-    "games": (255, 210, 90),
-    "travel": (255, 128, 96),
+# ---------- themes (fork) ----------
+# Every UI colour comes from the active theme. Pick one with "theme" in
+# config.json, or DASH_THEME=<name> in the environment (used for previews).
+# header: "solid" = flat accent bar (upstream look), "gradient" = accent ->
+# accent2 left to right with dark ink, "dark" = surface bar with the title in
+# the accent and an accent underline.
+_BASE_ACCENT = {
+    "clock": (86, 182, 255), "fx": (255, 190, 90), "sim": (110, 220, 150),
+    "openclash": (200, 140, 255), "weather": (90, 214, 200),
+    "monitor": (235, 120, 160), "games": (255, 210, 90), "travel": (255, 128, 96),
 }
+THEMES = {
+    "classic": {
+        "bg": (11, 18, 32), "fg": (230, 235, 245), "dim": (120, 130, 150),
+        "surface": (22, 28, 40), "surface_edge": (42, 48, 60), "line": (40, 44, 54),
+        "line_soft": (28, 32, 42), "track": (34, 40, 54), "row_sel": (28, 40, 56),
+        "off": (60, 65, 80), "thumb": (70, 76, 90), "header": "solid",
+        "accent": dict(_BASE_ACCENT), "accent2": dict(_BASE_ACCENT),
+    },
+    "midnight": {
+        "bg": (9, 12, 24), "fg": (238, 242, 252), "dim": (128, 140, 168),
+        "surface": (20, 26, 46), "surface_edge": (40, 50, 82), "line": (32, 40, 66),
+        "line_soft": (24, 30, 52), "track": (30, 38, 64), "row_sel": (30, 42, 78),
+        "off": (52, 62, 92), "thumb": (66, 78, 112), "header": "gradient",
+        "accent": dict(_BASE_ACCENT, clock=(96, 165, 255), sim=(56, 214, 176),
+                       monitor=(255, 105, 170), travel=(255, 122, 92)),
+        "accent2": dict(_BASE_ACCENT, clock=(155, 112, 255), sim=(72, 158, 255),
+                        monitor=(255, 160, 96), travel=(255, 196, 84)),
+    },
+    "aurora": {
+        "bg": (7, 7, 13), "fg": (242, 242, 252), "dim": (122, 126, 150),
+        "surface": (18, 18, 30), "surface_edge": (40, 40, 64), "line": (30, 30, 48),
+        "line_soft": (22, 22, 36), "track": (28, 28, 46), "row_sel": (26, 26, 50),
+        "off": (48, 48, 70), "thumb": (64, 64, 92), "header": "dark",
+        "accent": dict(_BASE_ACCENT, clock=(0, 214, 255), sim=(70, 255, 170),
+                       monitor=(196, 124, 255), travel=(255, 92, 146)),
+        "accent2": dict(_BASE_ACCENT, clock=(0, 214, 255), sim=(70, 255, 170),
+                        monitor=(196, 124, 255), travel=(255, 92, 146)),
+    },
+    "sunset": {
+        "bg": (19, 13, 23), "fg": (252, 242, 240), "dim": (170, 142, 156),
+        "surface": (34, 23, 38), "surface_edge": (64, 42, 64), "line": (50, 34, 54),
+        "line_soft": (38, 26, 42), "track": (52, 36, 56), "row_sel": (58, 36, 60),
+        "off": (80, 58, 82), "thumb": (98, 72, 98), "header": "gradient",
+        "accent": dict(_BASE_ACCENT, clock=(255, 94, 108), sim=(255, 146, 84),
+                       monitor=(236, 88, 176), travel=(255, 112, 78)),
+        "accent2": dict(_BASE_ACCENT, clock=(255, 176, 92), sim=(255, 214, 108),
+                        monitor=(150, 104, 255), travel=(255, 64, 140)),
+    },
+}
+
+
+def _theme_name():
+    name = os.environ.get("DASH_THEME")
+    if not name:
+        try:
+            name = json.loads(CONFIG_FILE.read_text()).get("theme")
+        except Exception:
+            name = None
+    return name if name in THEMES else "classic"
+
+
+THEME_NAME = _theme_name()
+_T = THEMES[THEME_NAME]
+BG, FG, DIM = _T["bg"], _T["fg"], _T["dim"]
+SURFACE, SURFACE_EDGE = _T["surface"], _T["surface_edge"]
+LINE, LINE_SOFT, TRACK, ROW_SEL = _T["line"], _T["line_soft"], _T["track"], _T["row_sel"]
+OFF, THUMB = _T["off"], _T["thumb"]
+HEADER_STYLE = _T["header"]
+ACCENT = _T["accent"]
+ACCENT2 = _T["accent2"]
+HEADER_INK = (14, 14, 22)
 
 MCC_COUNTRY = {
     "234": "UK", "235": "UK",
@@ -2771,7 +2830,7 @@ def draw_loading_overlay(base, label=None, phase_deg=0.0, accent=None):
         card_h = 116
         x0, y0 = cx - card_w / 2, cy - 44
         d.rounded_rectangle([x0, y0, x0 + card_w, y0 + card_h], radius=16,
-                            fill=(26, 34, 52), outline=(48, 58, 82))
+                            fill=SURFACE, outline=SURFACE_EDGE)
         draw_ring_spinner(d, cx, cy + 2, 17, phase_deg, accent)
         centered_text(d, cx, y0 + card_h - 28, label, f, FG)
     else:
@@ -2923,10 +2982,33 @@ def _header_text(d, x_right, text, f, color):
     d.text((x_right - (tb[2] - tb[0]) - tb[0], HEADER_MID - (tb[3] + tb[1]) / 2), text, font=f, fill=color)
 
 
+def _accent2_for(accent):
+    for k, v in ACCENT.items():
+        if v == accent:
+            return ACCENT2.get(k, accent)
+    return accent
+
+
+def _header_bar(d, accent, h):
+    """Paints the header bar for the theme; returns (ink, paper) -- the colour
+    for text/icons on it and the colour behind the right-hand status icons."""
+    if HEADER_STYLE == "gradient":
+        a2 = _accent2_for(accent)
+        for x in range(W):
+            d.line([x, 0, x, h], fill=_mix(accent, a2, x / (W - 1)))
+        return HEADER_INK, a2
+    if HEADER_STYLE == "dark":
+        d.rectangle([0, 0, W, h], fill=SURFACE)
+        d.rectangle([0, h - 2, W, h], fill=accent)
+        return FG, SURFACE
+    d.rectangle([0, 0, W, h], fill=accent)
+    return BG, accent
+
+
 def draw_header(d, label, accent, conn_type=None, cell_signal=None):
-    d.rectangle([0, 0, W, HEADER_H], fill=accent)
+    ink, paper = _header_bar(d, accent, HEADER_H)
     f_title = font("default_bold", 18)
-    d.text((14, 8), label, font=f_title, fill=BG)
+    d.text((14, 8), label, font=f_title, fill=accent if HEADER_STYLE == "dark" else ink)
 
     # Status items, right to left: battery (with its % inside) | WAN type
     # | cellular tech + bars -- all centred on the header's midline, in a
@@ -2963,35 +3045,37 @@ def draw_header(d, label, accent, conn_type=None, cell_signal=None):
     right_x = W - 12
     if battery:
         pct, plugged = battery
-        _draw_battery_icon(d, right_x, HEADER_MID, pct, BG, accent, (190, 30, 30))
+        _draw_battery_icon(d, right_x, HEADER_MID, pct, ink, paper, (190, 30, 30))
         right_x -= BATTERY_ICON_W + 3
         if plugged:
-            _draw_bolt(d, right_x - 7, HEADER_MID, BG)
+            _draw_bolt(d, right_x - 7, HEADER_MID, ink)
             right_x -= 10
         right_x -= 6
 
     if conn_type:
-        _header_text(d, right_x, conn_type, f_conn, BG)
+        _header_text(d, right_x, conn_type, f_conn, ink)
         right_x -= d.textlength(conn_type, font=f_conn) + 8
 
     if show["rat"]:
-        _header_text(d, right_x, rat, f_rat, BG)
+        _header_text(d, right_x, rat, f_rat, ink)
         right_x -= d.textlength(rat, font=f_rat) + 4
     if show["bars"]:
-        dim = _mix(BG, accent, 0.55)
-        draw_signal_bars(d, right_x - bars_w, HEADER_MID + HEADER_BAR_H / 2, cell_signal[0], BG, dim,
+        dim = _mix(ink, paper, 0.55)
+        draw_signal_bars(d, right_x - bars_w, HEADER_MID + HEADER_BAR_H / 2, cell_signal[0], ink, dim,
                          bar_w=HEADER_BAR_W, gap=HEADER_BAR_GAP, max_h=HEADER_BAR_H)
 
 
 def draw_back_header(d, label, accent):
-    d.rectangle([0, 0, W, 34], fill=accent)
-    d.text((12, 5), "‹", font=font("default_bold", 24), fill=BG)
-    d.text((32, 8), label, font=font("default_bold", 16), fill=BG)
+    ink, _ = _header_bar(d, accent, 34)
+    if HEADER_STYLE == "dark":
+        ink = accent
+    d.text((12, 5), "‹", font=font("default_bold", 24), fill=ink)
+    d.text((32, 8), label, font=font("default_bold", 16), fill=ink)
 
 
 def draw_toggle(d, x, y, on, accent, w=52, h=28):
     r = h / 2
-    color = accent if on else (60, 65, 80)
+    color = accent if on else OFF
     d.rounded_rectangle([x, y, x + w, y + h], radius=r, fill=color)
     knob_r = h / 2 - 3
     kx = x + w - r if on else x + r
@@ -3094,7 +3178,7 @@ def wrap_text_to_lines(d, text, f, max_w):
 
 
 def draw_tile(d, x0, y0, x1, y1, icon_fn, label, subtitle, accent):
-    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
     cx = (x0 + x1) / 2
     icon_fn(d, cx, y0 + 32, 20, accent)
     centered_text(d, cx, y0 + 58, label, font("default_bold", 14), FG)
@@ -3284,7 +3368,7 @@ def panel_travel(st, conn_type=None, cell_signal=None):
     tx0, ty0, tx1, ty1 = TRAVEL_SPEEDIFY_TOGGLE
     draw_toggle(d, tx0, ty0, sp == "CONNECTED", accent, w=tx1 - tx0, h=ty1 - ty0)
 
-    d.line([16, 80, W - 16, 80], fill=(40, 44, 54))
+    d.line([16, 80, W - 16, 80], fill=LINE)
 
     d.text((16, 93), "Ranch exit", font=f_lbl, fill=FG)
     if st["ranch"]:
@@ -3300,7 +3384,7 @@ def panel_travel(st, conn_type=None, cell_signal=None):
     tx0, ty0, tx1, ty1 = TRAVEL_RANCH_TOGGLE
     draw_toggle(d, tx0, ty0, st["ranch"], accent, w=tx1 - tx0, h=ty1 - ty0)
 
-    d.line([16, 148, W - 16, 148], fill=(40, 44, 54))
+    d.line([16, 148, W - 16, 148], fill=LINE)
 
     summary, s_col = travel_exit_summary(st)
     centered_text(d, W / 2, 166, summary, font("default_medium", 14), s_col)
@@ -3357,7 +3441,7 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None):
               "More", "Settings", ACCENT["clock"])
 
     sx0, sy0, sx1, sy1 = SMS_TILE
-    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
     _icon_sms(d, sx0 + 28, (sy0 + sy1) / 2, 13, ACCENT["clock"])
     messages = sms_messages or []
     if messages:
@@ -3467,7 +3551,7 @@ def _draw_signal_card(d, cell, carrier, airplane=False):
     bars + primary-carrier RSRP, and the serving carrier's name -- or,
     with cellular switched off, an unmissable airplane-mode state."""
     x0, y0, x1, y1 = SIM_SIGNAL_CARD
-    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
     ix0, ix1 = x0 + 7, x1 - 7
     if airplane:
         _icon_airplane(d, (x0 + x1) / 2, y0 + 22, 13, AIRPLANE_COLOR)
@@ -3492,7 +3576,7 @@ def _draw_signal_card(d, cell, carrier, airplane=False):
     sig = get_cell_signal(cell)
     bars = sig[0] if sig else 0
     bars_base = y0 + 43
-    draw_signal_bars(d, ix0, bars_base, bars, ACCENT["sim"], (60, 65, 80), bar_w=4, gap=2, max_h=14)
+    draw_signal_bars(d, ix0, bars_base, bars, ACCENT["sim"], OFF, bar_w=4, gap=2, max_h=14)
     rsrp = cell.get("rsrp")
     if isinstance(rsrp, int):
         f_num, f_unit = font("default_bold", 11), font("default_medium", 8)
@@ -3643,7 +3727,7 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_acti
     centered_text(d, W / 2, 228, caption, font("default_medium", 11), DIM)
 
     wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
-    d.rounded_rectangle([wx0, wy0, wx1, wy1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    d.rounded_rectangle([wx0, wy0, wx1, wy1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
     _icon_shield(d, wx0 + 24, (wy0 + wy1) / 2, 11, ACCENT["sim"])
     peers = wg_peers or []
     active = next((p["name"] for p in peers if p["id"] == wg_active), None)
@@ -3676,14 +3760,14 @@ def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
     tx0, ty0, tx1, ty1 = OC_TOGGLE_RECT
     draw_toggle(d, tx0, ty0, openclash_toggle_on(oc), ACCENT["openclash"], w=tx1 - tx0, h=ty1 - ty0)
 
-    d.line([16, 72, W - 16, 72], fill=(40, 44, 54))
+    d.line([16, 72, W - 16, 72], fill=LINE)
 
     d.text((16, 80), "Mode", font=font("default_medium", 14), fill=DIM)
     sx0, sy0, sx1, sy1 = OC_MODE_SEG_RECT
     sel_idx = 0 if oc["mode"] == "global" else 1
     draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Global", "Rule"], sel_idx, ACCENT["openclash"])
 
-    d.line([16, 138, W - 16, 138], fill=(40, 44, 54))
+    d.line([16, 138, W - 16, 138], fill=LINE)
 
     d.text((16, 146), "Node  ›", font=font("default_medium", 14), fill=DIM)
     if not traf["running"]:
@@ -3699,7 +3783,7 @@ def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
     else:
         d.text((16, 166), "no subscription yet", font=font("default_medium", 13), fill=DIM)
 
-    d.line([16, 192, W - 16, 192], fill=(40, 44, 54))
+    d.line([16, 192, W - 16, 192], fill=LINE)
 
     d.text((16, 200), "Traffic (session)", font=font("default_medium", 14), fill=DIM)
     if traf["running"] and traf["up_mb"] is not None:
@@ -3761,7 +3845,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     up_txt = f"↑ {net_up:.1f} Mbps" if net_up is not None else "—"
     d.text((W / 2 + 8, 79), truncate_to_width(d, up_txt, f_bw, W / 2 - 22), font=f_bw, fill=FG)
 
-    d.line([16, 116, W - 16, 116], fill=(40, 44, 54))
+    d.line([16, 116, W - 16, 116], fill=LINE)
 
     d.text((16, 124), "CPU", font=font("default_medium", 14), fill=FG)
     cpu_txt = f"{cpu_pct:.0f}%" if cpu_pct is not None else "—"
@@ -3791,7 +3875,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
         elif bw > 0:
             d.rectangle([bx0 + 2, by0 + 2, bx0 + 2 + bw, by1 - 2], fill=ACCENT["monitor"])
 
-    d.line([16, 230, W - 16, 230], fill=(40, 44, 54))
+    d.line([16, 230, W - 16, 230], fill=LINE)
 
     f_row = font("default_medium", 15)
     temp_txt = f"{temp_c:.0f}°C" if temp_c is not None else "—"
@@ -3803,7 +3887,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     d.text((76, 264), up_txt, font=f_row, fill=FG)
 
     x0, y0, x1, y1 = MONITOR_SPEEDTEST_BTN
-    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
+    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
     _icon_speedometer(d, (x0 + x1) / 2, y0 + 17, 11, ACCENT["monitor"])
     centered_text(d, (x0 + x1) / 2, y0 + 27, "Speed test", font("default_bold", 12), FG)
 
@@ -3902,7 +3986,7 @@ def _draw_speed_gauge(d, frac, color):
                 m.ellipse([ex - half, ey - half, ex + half, ey + half], fill=255)
         return paint
 
-    _draw_aa(d, x0, y0, size, size, (34, 40, 54), arc_mask(a0, a0 + sweep))
+    _draw_aa(d, x0, y0, size, size, TRACK, arc_mask(a0, a0 + sweep))
     if frac > 0.004:
         _draw_aa(d, x0, y0, size, size, color, arc_mask(a0, a0 + sweep * frac))
 
@@ -3976,7 +4060,7 @@ def panel_speedtest(snap, spin_phase=0.0):
         # thin progress bar for the current phase, under the dial opening
         bw = 80
         bx0 = cx - bw / 2
-        _draw_pill(d, bx0, cy + 44, bx0 + bw, cy + 48, (34, 40, 54))
+        _draw_pill(d, bx0, cy + 44, bx0 + bw, cy + 48, TRACK)
         pw = bw * snap["progress"]
         if pw > 0:
             _draw_pill(d, bx0, cy + 44, bx0 + pw, cy + 48, color)
@@ -3985,8 +4069,8 @@ def panel_speedtest(snap, spin_phase=0.0):
                                       (SPEEDTEST_UP_CARD, "Upload", "up", True, SPEEDTEST_UP_COLOR)):
         x0, y0, x1, y1 = rect
         active = running and phase == ("upload" if up else "download")
-        d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40),
-                            outline=col if active else (42, 48, 60), width=1)
+        d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=SURFACE,
+                            outline=col if active else SURFACE_EDGE, width=1)
         _draw_arrow(d, x0 + 14, y0 + 13, up, col, size=5)
         d.text((x0 + 24, y0 + 6), label, font=font("default_medium", 11), fill=DIM)
         val = snap[key]
@@ -4067,7 +4151,7 @@ def panel_weather(cfg, days, conn_type=None, cell_signal=None):
         if day.get("precip") is not None:
             centered_text(d, cx, 210, f"{day['precip']:.0f}%", font("default_medium", 11), ACCENT["weather"])
 
-    d.line([16, 236, W - 16, 236], fill=(40, 44, 54))
+    d.line([16, 236, W - 16, 236], fill=LINE)
     today_label, _ = wmo_info(days[0]["code"])
     centered_text(d, W / 2, 246, today_label, font("default_medium", 14), FG)
 
@@ -4098,7 +4182,7 @@ def panel_weather_detail(cfg, day, aq, day_label):
     centered_text(d, W / 2, 130, label, font("default_medium", 14), FG)
     centered_text(d, W / 2, 150, f"{round(day['tmax'])}° / {round(day['tmin'])}°", font("default_bold", 20), FG)
 
-    d.line([16, WEATHER_DETAIL_ROWS_TOP - 10, W - 16, WEATHER_DETAIL_ROWS_TOP - 10], fill=(40, 44, 54))
+    d.line([16, WEATHER_DETAIL_ROWS_TOP - 10, W - 16, WEATHER_DETAIL_ROWS_TOP - 10], fill=LINE)
 
     feels_max, feels_min = day.get("feels_max"), day.get("feels_min")
     feels_val = (f"{round(feels_max)}° / {round(feels_min)}°"
@@ -4124,7 +4208,7 @@ def panel_weather_detail(cfg, day, aq, day_label):
         vbbox = d.textbbox((0, 0), rval, font=val_font)
         d.text((W - 16 - (vbbox[2] - vbbox[0]), y), rval, font=val_font, fill=val_color)
         if i > 0:
-            d.line([16, y - 8, W - 16, y - 8], fill=(28, 32, 42))
+            d.line([16, y - 8, W - 16, y - 8], fill=LINE_SOFT)
 
     return img
 
@@ -4210,14 +4294,14 @@ def panel_more(wifi24, wifi_band, clock_style, wifi56_disabled_idx=None):
         d.text((tx, ty), label, font=f, fill=(60, 64, 74))
         centered_text(d, (sx0 + sx1) / 2, sy1 + 6, "Matches repeater band", font("default_medium", 10), DIM)
 
-    d.line([16, 150, W - 16, 150], fill=(40, 44, 54))
+    d.line([16, 150, W - 16, 150], fill=LINE)
 
     d.text((16, 160), "Clock Style", font=font("default_medium", 15), fill=FG)
     sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
     sel_idx = 0 if clock_style == "analog" else 1
     draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Analog", "Digital"], sel_idx, ACCENT["clock"])
 
-    d.line([16, 222, W - 16, 222], fill=(40, 44, 54))
+    d.line([16, 222, W - 16, 222], fill=LINE)
 
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=ACCENT["clock"], width=2)
@@ -4296,7 +4380,7 @@ def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=
         d.text((16, 44), "Not connected", font=font("default_medium", 15), fill=DIM)
         d.text((16, 64), "Tap a network below to connect", font=font("default_medium", 11), fill=DIM)
 
-    d.line([16, REPEATER_LIST_TOP - 4, W - 16, REPEATER_LIST_TOP - 4], fill=(40, 44, 54))
+    d.line([16, REPEATER_LIST_TOP - 4, W - 16, REPEATER_LIST_TOP - 4], fill=LINE)
 
     if not networks:
         centered_text(d, W / 2, 160, "Scanning…", font("default_medium", 13), DIM)
@@ -4329,7 +4413,7 @@ def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=
     if max_scroll > 0:
         thumb_h = max(20, list_h * list_h / content_h)
         thumb_y = REPEATER_LIST_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
-        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=THUMB)
     return img
 
 
@@ -4384,7 +4468,7 @@ def panel_sms(messages, scroll_px=0):
         preview = truncate_to_width(ld, msg["body"].replace("\n", " "), f_body, W - 32)
         ld.text((16, y0 + 27), preview, font=f_body, fill=DIM)
         if i > 0:
-            ld.line([16, y0, W - 16, y0], fill=(28, 32, 42))
+            ld.line([16, y0, W - 16, y0], fill=LINE_SOFT)
     img.paste(list_img, (0, SMS_LIST_TOP))
 
     content_h = len(messages) * SMS_ROW_H
@@ -4392,7 +4476,7 @@ def panel_sms(messages, scroll_px=0):
     if max_scroll > 0:
         thumb_h = max(20, list_h * list_h / content_h)
         thumb_y = SMS_LIST_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
-        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=THUMB)
     return img
 
 
@@ -4412,7 +4496,7 @@ def panel_sms_detail(msg):
     draw_back_header(d, msg["from"], ACCENT["clock"])
     when = msg["sent"].strftime("%a %d %b %Y, %H:%M") if msg["sent"] else msg.get("sent_raw", "")
     centered_text(d, W / 2, 40, when, font("default_medium", 12), DIM)
-    d.line([16, 62, W - 16, 62], fill=(40, 44, 54))
+    d.line([16, 62, W - 16, 62], fill=LINE)
 
     f = font("default_cn_medium", 15)
     y = 74
@@ -4571,7 +4655,7 @@ def panel_wireguard(peers, active_id, scroll_px=0, filter_country=None):
         return img
 
     draw_wireguard_chips(d, peers, filter_country)
-    d.line([16, WIREGUARD_LIST_TOP - 6, W - 16, WIREGUARD_LIST_TOP - 6], fill=(40, 44, 54))
+    d.line([16, WIREGUARD_LIST_TOP - 6, W - 16, WIREGUARD_LIST_TOP - 6], fill=LINE)
 
     visible = wireguard_visible_peers(peers, filter_country)
     if not visible:
@@ -4597,7 +4681,7 @@ def panel_wireguard(peers, active_id, scroll_px=0, filter_country=None):
         ty0 = y0 + (WIREGUARD_ROW_H - WIREGUARD_TOGGLE_H) / 2
         draw_toggle(ld, tx0, ty0, is_on, ACCENT["sim"], w=WIREGUARD_TOGGLE_W, h=WIREGUARD_TOGGLE_H)
         if i > 0:
-            ld.line([16, y0, W - 16, y0], fill=(28, 32, 42))
+            ld.line([16, y0, W - 16, y0], fill=LINE_SOFT)
     img.paste(list_img, (0, WIREGUARD_LIST_TOP))
 
     content_h = len(visible) * WIREGUARD_ROW_H
@@ -4605,7 +4689,7 @@ def panel_wireguard(peers, active_id, scroll_px=0, filter_country=None):
     if max_scroll > 0:
         thumb_h = max(20, list_h * list_h / content_h)
         thumb_y = WIREGUARD_LIST_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
-        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=THUMB)
     return img
 
 
@@ -4657,7 +4741,7 @@ def draw_game_chrome(d, title, accent, score_text=None):
     their content at y=34) so a game screen doesn't look out of place
     next to the rest of the dashboard."""
     d.rectangle([0, 0, W, 34], fill=(16, 22, 34))
-    d.line([0, 34, W, 34], fill=(40, 44, 54))
+    d.line([0, 34, W, 34], fill=LINE)
     f_title = font("default_bold", 16)
     d.text((12, 8), title, font=f_title, fill=accent)
     if score_text:
@@ -4707,7 +4791,7 @@ def panel_games(scores):
     for i, key in enumerate(GAME_NAMES):
         y0 = GAMES_HUB_TOP + i * GAMES_HUB_ROW_H
         y1 = y0 + GAMES_HUB_ROW_H - 10
-        d.rounded_rectangle([12, y0, W - 12, y1], radius=10, outline=(48, 58, 82), width=1)
+        d.rounded_rectangle([12, y0, W - 12, y1], radius=10, outline=SURFACE_EDGE, width=1)
         d.text((24, y0 + 13), GAME_LABELS[key], font=font("default_bold", 16), fill=FG)
         best = scores.get(key, 0)
         d.text((24, y0 + 33), "Best: %s" % best, font=font("default_medium", 12), fill=DIM)
@@ -5253,24 +5337,24 @@ def panel_keyboard(title, text, layer, caps, accent, connect_label="Connect"):
     y = KB_ROW_Y0
     for row in kb_rows(layer, caps):
         for lbl, x0, y0, x1, y1 in layout_row(row, y):
-            d.rounded_rectangle([x0, y0, x1, y1], radius=4, fill=(28, 32, 42))
+            d.rounded_rectangle([x0, y0, x1, y1], radius=4, fill=LINE_SOFT)
             centered_text(d, (x0 + x1) / 2, y0 + (y1 - y0) / 2 - 7, lbl, font("default_medium", 13), FG)
         y += KB_ROW_H
 
     cx0, cy0, cx1, cy1 = KB_CAPS_RECT
-    d.rounded_rectangle([cx0, cy0, cx1, cy1], radius=6, fill=(28, 32, 42))
+    d.rounded_rectangle([cx0, cy0, cx1, cy1], radius=6, fill=LINE_SOFT)
     centered_text(d, (cx0 + cx1) / 2, cy0 + 9, "CAP", font("default_medium", 12), accent if caps else FG)
 
     lx0, ly0, lx1, ly1 = KB_LAYER_TOGGLE_RECT
-    d.rounded_rectangle([lx0, ly0, lx1, ly1], radius=6, fill=(28, 32, 42))
+    d.rounded_rectangle([lx0, ly0, lx1, ly1], radius=6, fill=LINE_SOFT)
     centered_text(d, (lx0 + lx1) / 2, ly0 + 9, "ABC" if layer == "symbols" else "123", font("default_medium", 12), accent)
 
     sx0, sy0, sx1, sy1 = KB_SPACE_RECT
-    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=6, fill=(28, 32, 42))
+    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=6, fill=LINE_SOFT)
     centered_text(d, (sx0 + sx1) / 2, sy0 + 9, "Space", font("default_medium", 13), FG)
 
     bx0, by0, bx1, by1 = KB_BACKSPACE_RECT
-    d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, fill=(28, 32, 42))
+    d.rounded_rectangle([bx0, by0, bx1, by1], radius=6, fill=LINE_SOFT)
     centered_text(d, (bx0 + bx1) / 2, by0 + 9, "DEL", font("default_medium", 12), FG)
 
     ax0, ay0, ax1, ay1 = KB_CANCEL_RECT
@@ -5325,7 +5409,7 @@ def panel_picker(title, accent, items, selected):
         y0 = PICKER_TOP + i * row_h
         sel = key == selected
         if sel:
-            d.rectangle([0, y0, W, y0 + row_h], fill=(28, 40, 56))
+            d.rectangle([0, y0, W, y0 + row_h], fill=ROW_SEL)
         bbox = d.textbbox((0, 0), label, font=f)
         th = bbox[3] - bbox[1]
         color = accent if sel else FG
@@ -5333,7 +5417,7 @@ def panel_picker(title, accent, items, selected):
         if sel:
             d.text((W - 30, y0 + (row_h - th) / 2 - bbox[1]), "✓", font=f, fill=accent)
         if i > 0:
-            d.line([0, y0, W, y0], fill=(28, 32, 42))
+            d.line([0, y0, W, y0], fill=LINE_SOFT)
     return img
 
 
@@ -5362,7 +5446,7 @@ def panel_scroll_picker(title, accent, items, selected, scroll_px, font_name="de
             continue
         sel = key == selected
         if sel:
-            ld.rectangle([0, y0, W, y0 + SCROLL_ROW_H], fill=(28, 40, 56))
+            ld.rectangle([0, y0, W, y0 + SCROLL_ROW_H], fill=ROW_SEL)
         label = truncate_to_width(ld, label, f, max_label_w)
         bbox = ld.textbbox((0, 0), label, font=f)
         th = bbox[3] - bbox[1]
@@ -5373,7 +5457,7 @@ def panel_scroll_picker(title, accent, items, selected, scroll_px, font_name="de
             cth = cbbox[3] - cbbox[1]
             ld.text((W - 30, y0 + (SCROLL_ROW_H - cth) / 2 - cbbox[1]), "✓", font=check_f, fill=accent)
         if i > 0:
-            ld.line([0, y0, W, y0], fill=(28, 32, 42))
+            ld.line([0, y0, W, y0], fill=LINE_SOFT)
     img.paste(list_img, (0, PICKER_TOP))
 
     content_h = len(items) * SCROLL_ROW_H
@@ -5383,7 +5467,7 @@ def panel_scroll_picker(title, accent, items, selected, scroll_px, font_name="de
         thumb_y = PICKER_TOP + (scroll_px / max_scroll) * (list_h - thumb_h)
         # plain rectangle, not rounded -- too thin (4px) for PIL's corner math,
         # which raises ValueError on some Pillow builds at this aspect ratio
-        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=(70, 76, 90))
+        d.rectangle([W - 6, thumb_y, W - 2, thumb_y + thumb_h], fill=THUMB)
     return img
 
 
