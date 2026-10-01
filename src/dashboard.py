@@ -3339,7 +3339,7 @@ def travel_installed():
 
 def travel_status_empty(installed=False):
     return {"installed": installed, "speedify": None, "ranch": False,
-            "tunnel": None, "handshake_s": None, "tailscale": False}
+            "tunnel": None, "handshake_s": None, "tailscale": None}
 
 
 def _speedify_json(*args, timeout=10):
@@ -3355,15 +3355,27 @@ def get_speedify_state():
     return j.get("state") if isinstance(j, dict) else None
 
 
-def get_tailscale_up():
-    """Tailscale counts as up when tailscale0 holds a 100.x tailnet address."""
-    out = run(["ip", "-4", "addr", "show", "dev", "tailscale0"], timeout=3)
-    return "inet 100." in out
+def get_tailscale_state():
+    """'exit' = routing through an exit node that is online, 'exit_offline'
+    = an exit node is set but offline, 'up' = running without an exit node,
+    'down' = not running. Tailscale stays on, so only the exit node lights
+    the Home badge."""
+    out = run(["tailscale", "status", "--json"], timeout=5)
+    try:
+        j = json.loads(out)
+    except Exception:
+        return "down"
+    if j.get("BackendState") != "Running":
+        return "down"
+    ens = j.get("ExitNodeStatus")
+    if ens:
+        return "exit" if ens.get("Online") else "exit_offline"
+    return "up"
 
 
 def get_travel_status():
     st = travel_status_empty(travel_installed())
-    st["tailscale"] = get_tailscale_up()
+    st["tailscale"] = get_tailscale_state()
     if not st["installed"]:
         return st
     st["speedify"] = get_speedify_state()
@@ -3494,7 +3506,7 @@ def status_badges(travel, wg_active):
         ranch_state = "off"
     return [("Speedify", sp_state), ("Home IP", ranch_state),
             ("WireGuard", "on" if wg_active else "off"),
-            ("Tailscale", "on" if travel.get("tailscale") else "off")]
+            ("Tailscale", {"exit": "on", "exit_offline": "warn", "down": "bad"}.get(travel.get("tailscale"), "off"))]
 
 
 def draw_status_badges(d, travel, wg_active):
@@ -5825,7 +5837,7 @@ def mode_preview(outdir):
     screens = [
         ("clock", panel_clock(cfg, rep, conn_type, cell_signal, sms_messages, travel, wg_active)),
         ("clock_digital", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages, travel, wg_active)),
-        ("clock_badges_demo", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages, dict(travel, speedify="CONNECTED", ranch=True, tunnel=False, tailscale=True), "peer_demo")),
+        ("clock_badges_demo", panel_clock(cfg_digital, rep, conn_type, cell_signal, sms_messages, dict(travel, speedify="CONNECTED", ranch=True, tunnel=False, tailscale="exit"), "peer_demo")),
         ("sim", panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info)),
         ("sim_confirm", panel_confirm("Mobile data", "Turn mobile data off? SMS and calls still work. Internet runs over cellular right now, so the router will go offline.", ACCENT["sim"], yes_label="Turn off", danger=True)),
         ("sim_verifying", draw_loading_overlay(panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info), "Registering… 7s", 120, ACCENT["sim"])),
