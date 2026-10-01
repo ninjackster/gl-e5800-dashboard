@@ -3339,7 +3339,7 @@ def panel_travel(st, conn_type=None, cell_signal=None):
 
     summary, s_col = travel_exit_summary(st)
     centered_text(d, W / 2, 214, summary, font("default_medium", 14), s_col)
-    hint = ("If the ranch is offline, turn Ranch exit off." if st["ranch"]
+    hint = ("Ranch offline? Turn Ranch exit off." if st["ranch"]
             else "Ranch exit works with or without Speedify.")
     for i, line in enumerate(wrap_text_to_lines(d, hint, font("default_medium", 11), W - 40)):
         centered_text(d, W / 2, 242 + i * 15, line, font("default_medium", 11), DIM)
