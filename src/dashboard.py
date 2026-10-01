@@ -51,6 +51,7 @@ ACCENT = {
     "weather": (90, 214, 200),
     "monitor": (235, 120, 160),
     "games": (255, 210, 90),
+    "travel": (255, 128, 96),
 }
 
 MCC_COUNTRY = {
@@ -2823,10 +2824,12 @@ def new_canvas():
     return img, ImageDraw.Draw(img)
 
 
-def draw_page_dots(d, active_idx, count=7):
+def draw_page_dots(d, active_idx, count=None):
     """Dot centres are 16px apart, so the row spans (count - 1) * 16
     between the first and last centre -- centring on that, not on
     count * 16, which put the whole row 8px left of the screen's middle."""
+    if count is None:
+        count = len(PANEL_NAMES)
     step = 16
     x0 = W / 2 - (count - 1) * step / 2
     y = H - 18
@@ -3176,7 +3179,185 @@ WEATHER_CITY_ZONE = (34, 66)
 
 PICKER_TOP, PICKER_BOTTOM = 38, 316
 
-PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "openclash", "games"]
+# ---------- travel: Speedify bonding + ranch home-IP exit ----------
+#
+# Not part of upstream. Drives two things set up on this router outside the
+# dashboard: Speedify (speedify_cli) and /usr/bin/homeip, which routes LAN
+# clients through a WireGuard tunnel (wgranch) to a home router so they exit
+# with the home IP. homeip also flips Speedify's PEP, whose TPROXY would
+# otherwise grab LAN TCP before the WireGuard policy rule.
+
+SPEEDIFY_CLI = "/usr/share/speedify/speedify_cli"
+HOMEIP = "/usr/bin/homeip"
+TRAVEL_CELL_ADAPTERS = ("rmnet_data0", "rmnet_data1")
+TRAVEL_CONNECT_TIMEOUT = 60
+TRAVEL_SPEEDIFY_TOGGLE = (172, 38, 218, 60)
+TRAVEL_RANCH_TOGGLE = (172, 92, 218, 114)
+TRAVEL_CELL_TOGGLE = (172, 160, 218, 182)
+
+
+def travel_installed():
+    return os.path.exists(SPEEDIFY_CLI) and os.path.exists(HOMEIP)
+
+
+def travel_status_empty(installed=False):
+    return {"installed": installed, "speedify": None, "ranch": False,
+            "tunnel": None, "handshake_s": None, "cell": None}
+
+
+def _speedify_json(*args, timeout=10):
+    out = run([SPEEDIFY_CLI] + list(args), timeout=timeout)
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def get_speedify_state():
+    j = _speedify_json("state")
+    return j.get("state") if isinstance(j, dict) else None
+
+
+def get_speedify_cell_priority():
+    """'always' / 'automatic' / ... for the first cellular adapter Speedify
+    knows about, or None when it can't be read."""
+    j = _speedify_json("show", "adapters")
+    if not isinstance(j, list):
+        return None
+    for a in j:
+        if isinstance(a, dict) and a.get("name") in TRAVEL_CELL_ADAPTERS and a.get("priority"):
+            return a["priority"]
+    return None
+
+
+def get_travel_status():
+    st = travel_status_empty(travel_installed())
+    if not st["installed"]:
+        return st
+    st["speedify"] = get_speedify_state()
+    st["cell"] = get_speedify_cell_priority()
+    out = run([HOMEIP, "status"], timeout=10)
+    st["ranch"] = "exit: RANCH" in out
+    if st["ranch"]:
+        m = re.search(r"handshake (\d+)s ago", out)
+        if m:
+            st["tunnel"], st["handshake_s"] = True, int(m.group(1))
+        else:
+            st["tunnel"] = "tunnel: up" in out
+    return st
+
+
+def set_speedify_connected(want):
+    run([SPEEDIFY_CLI, "connect", "closest"] if want else [SPEEDIFY_CLI, "disconnect"], timeout=30)
+    deadline = time.time() + TRAVEL_CONNECT_TIMEOUT
+    while time.time() < deadline:
+        if (get_speedify_state() == "CONNECTED") == want:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def set_ranch_exit(want):
+    # homeip reloads the network and, when turning on, waits for the first
+    # handshake itself; its exit code is all we need.
+    ok, _ = run_checked([HOMEIP, "on" if want else "off"], timeout=60)
+    return ok
+
+
+def set_speedify_cell_priority(always):
+    want = "always" if always else "automatic"
+    for a in TRAVEL_CELL_ADAPTERS:
+        run([SPEEDIFY_CLI, "adapter", "priority", a, want], timeout=10)
+    return get_speedify_cell_priority() == want
+
+
+def travel_exit_summary(st):
+    if st["ranch"]:
+        return "Devices exit: ranch home IP", ACCENT["travel"]
+    if st["speedify"] == "CONNECTED":
+        return "Devices exit: Speedify server", FG
+    return "Devices exit: this network", DIM
+
+
+def panel_travel(st, conn_type=None, cell_signal=None):
+    img, d = new_canvas()
+    accent = ACCENT["travel"]
+    draw_header(d, "TRAVEL", accent, conn_type, cell_signal)
+    idx = PANEL_NAMES.index("travel")
+    if not st["installed"]:
+        centered_text(d, W / 2, 130, "Speedify or homeip", font("default_medium", 14), DIM)
+        centered_text(d, W / 2, 150, "isn't set up here", font("default_medium", 14), DIM)
+        draw_page_dots(d, idx)
+        return img
+
+    f_lbl, f_sub = font("default_medium", 16), font("default_medium", 11)
+    sp = st["speedify"]
+    d.text((16, 39), "Speedify", font=f_lbl, fill=FG)
+    if sp == "CONNECTED":
+        sp_txt, sp_col = "Bonding", accent
+    elif sp in ("CONNECTING", "AUTO_CONNECTING"):
+        sp_txt, sp_col = "Connecting…", (230, 170, 90)
+    elif sp is None:
+        sp_txt, sp_col = "State unknown", DIM
+    else:
+        sp_txt, sp_col = "Off", DIM
+    d.text((16, 58), sp_txt, font=f_sub, fill=sp_col)
+    tx0, ty0, tx1, ty1 = TRAVEL_SPEEDIFY_TOGGLE
+    draw_toggle(d, tx0, ty0, sp == "CONNECTED", accent, w=tx1 - tx0, h=ty1 - ty0)
+
+    d.line([16, 80, W - 16, 80], fill=(40, 44, 54))
+
+    d.text((16, 93), "Ranch exit", font=f_lbl, fill=FG)
+    if st["ranch"]:
+        d.text((16, 112), "Home IP 104.52.1.116", font=f_sub, fill=accent)
+        if st["tunnel"]:
+            hs = st["handshake_s"]
+            t_txt = "Tunnel up" + (f" · {hs}s" if hs is not None else "")
+            d.text((16, 128), t_txt, font=f_sub, fill=(110, 220, 150))
+        else:
+            d.text((16, 128), "Tunnel DOWN · no internet", font=font("default_bold", 11), fill=(240, 90, 90))
+    else:
+        d.text((16, 112), "Off", font=f_sub, fill=DIM)
+    tx0, ty0, tx1, ty1 = TRAVEL_RANCH_TOGGLE
+    draw_toggle(d, tx0, ty0, st["ranch"], accent, w=tx1 - tx0, h=ty1 - ty0)
+
+    d.line([16, 148, W - 16, 148], fill=(40, 44, 54))
+
+    d.text((16, 161), "Cellular in Speedify", font=f_lbl, fill=FG)
+    cell = st["cell"]
+    if cell == "always":
+        c_txt, c_col = "Always · full bonding", accent
+    elif cell:
+        c_txt, c_col = f"{cell.capitalize()} · light use", DIM
+    else:
+        c_txt, c_col = "Unknown", DIM
+    d.text((16, 180), c_txt, font=f_sub, fill=c_col)
+    tx0, ty0, tx1, ty1 = TRAVEL_CELL_TOGGLE
+    draw_toggle(d, tx0, ty0, cell == "always", accent, w=tx1 - tx0, h=ty1 - ty0)
+
+    d.line([16, 200, W - 16, 200], fill=(40, 44, 54))
+
+    summary, s_col = travel_exit_summary(st)
+    centered_text(d, W / 2, 214, summary, font("default_medium", 14), s_col)
+    hint = ("If the ranch is offline, turn Ranch exit off." if st["ranch"]
+            else "Ranch exit works with or without Speedify.")
+    for i, line in enumerate(wrap_text_to_lines(d, hint, font("default_medium", 11), W - 40)):
+        centered_text(d, W / 2, 242 + i * 15, line, font("default_medium", 11), DIM)
+    draw_page_dots(d, idx)
+    return img
+
+
+def hit_main_travel(x, y):
+    for zone, rect in (("speedify", TRAVEL_SPEEDIFY_TOGGLE),
+                       ("ranch", TRAVEL_RANCH_TOGGLE),
+                       ("cell", TRAVEL_CELL_TOGGLE)):
+        tx0, ty0, tx1, ty1 = rect
+        if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
+            return zone
+    return None
+
+
+PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "openclash", "games", "travel"]
 
 
 # ---------- main panels ----------
@@ -5498,6 +5679,10 @@ def mode_preview(outdir):
                                             "up": 41.3, "bytes": 205e6, "error": None, "via": conn_type})),
         ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
         ("openclash", panel_openclash(oc, traf, conn_type, cell_signal)),
+        ("travel", panel_travel(get_travel_status(), conn_type, cell_signal)),
+        ("travel_ranch_demo", panel_travel(dict(travel_status_empty(True), speedify="CONNECTED", ranch=True, tunnel=True, handshake_s=12, cell="always"), conn_type, cell_signal)),
+        ("travel_down_demo", panel_travel(dict(travel_status_empty(True), speedify="DISCONNECTED", ranch=True, tunnel=False, cell="automatic"), conn_type, cell_signal)),
+        ("travel_confirm", panel_confirm("Ranch exit", "Send all devices out the ranch home IP? If the ranch is offline they lose internet until you turn this off.", ACCENT["travel"], yes_label="Turn on")),
         ("city_top", panel_city_picker("top", cfg)),
         ("city_bottom", panel_city_picker("bottom", cfg)),
         ("fx_top_from", panel_currency_picker("top", "from", cfg)),
@@ -5759,6 +5944,8 @@ def mode_live():
     # OpenClash also gets started/stopped from LuCI or the GL app.
     refresher.add("oc", get_openclash_status, 10)
     refresher.add("traf", get_openclash_traffic_and_node, 20)
+    # 5s: Speedify and the ranch tunnel also change from the GL UI and LuCI.
+    refresher.add("travel", get_travel_status, 5)
     refresher.add("wx", lambda: fetch_weather(cfg["weather_city"]), 1800)
     refresher.add("aq", lambda: fetch_air_quality(cfg["weather_city"]), 1800)
     refresher.add("sms", get_sms_messages, 15)
@@ -5790,6 +5977,7 @@ def mode_live():
            "iccid": None, "attached": False, "roaming": False, "carrier": None, "airplane": False}
     oc = openclash_status_empty(openclash_installed())
     traf = openclash_traffic_empty()
+    travel = travel_status_empty(travel_installed())
     wx, aq = [], []
     sms_messages = []
     wg_peers, wg_active = [], None
@@ -5845,6 +6033,8 @@ def mode_live():
             return panel_weather(cfg, wx, conn_type, cell_signal)
         elif name == "games":
             return panel_games(game_scores)
+        elif name == "travel":
+            return panel_travel(travel, conn_type, cell_signal)
         else:
             net_iface = net_sample[0] if net_sample else None
             return panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, mon_uptime_min, conn_type, cell_signal)
@@ -6264,11 +6454,16 @@ def mode_live():
     def is_openclash_action(action):
         return action.startswith("oc_")
 
+    def is_travel_action(action):
+        return action.startswith("tr_")
+
     def confirm_accent():
         if is_sim_toggle_action(confirm_action):
             return ACCENT["sim"]
         if is_openclash_action(confirm_action):
             return ACCENT["openclash"]
+        if is_travel_action(confirm_action):
+            return ACCENT["travel"]
         return ACCENT["clock"]
 
     def openclash_confirm(zone):
@@ -6298,6 +6493,79 @@ def mode_live():
             confirm_danger = False
         confirm_return_view = "main"
         return None
+
+    def travel_confirm(zone):
+        """Every travel toggle asks first: each one changes where all the
+        devices' traffic goes, or how much mobile data Speedify uses."""
+        nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action
+        nonlocal confirm_return_view, confirm_danger
+        if not travel["installed"]:
+            return "Speedify or homeip isn't set up on this router"
+        confirm_danger = False
+        if zone == "speedify":
+            want = travel["speedify"] != "CONNECTED"
+            confirm_title = "Speedify"
+            if want:
+                confirm_message = "Connect Speedify? Bonds Wi-Fi and cellular through a Speedify server."
+                confirm_yes_label = "Connect"
+            else:
+                confirm_message = "Disconnect Speedify? Devices go back to the normal connection."
+                confirm_yes_label = "Disconnect"
+            confirm_action = f"tr_speedify:{'on' if want else 'off'}"
+        elif zone == "ranch":
+            want = not travel["ranch"]
+            confirm_title = "Ranch exit"
+            if want:
+                confirm_message = "Send all devices out the ranch home IP? If the ranch is offline they lose internet until you turn this off."
+                confirm_yes_label = "Turn on"
+            else:
+                confirm_message = "Stop using the ranch home IP? Devices go back to the normal exit."
+                confirm_yes_label = "Turn off"
+            confirm_action = f"tr_ranch:{'on' if want else 'off'}"
+        else:
+            want = travel["cell"] != "always"
+            confirm_title = "Cellular"
+            if want:
+                confirm_message = "Let Speedify use cellular fully? Faster bonding, but it uses mobile data."
+                confirm_yes_label = "Always"
+            else:
+                confirm_message = "Back to automatic? Speedify will use cellular lightly."
+                confirm_yes_label = "Automatic"
+            confirm_action = f"tr_cell:{'on' if want else 'off'}"
+        confirm_return_view = "main"
+        return None
+
+    def run_travel_action(action):
+        """Runs a confirmed travel toggle under a spinner over the Travel
+        page, then publishes the freshly read state."""
+        nonlocal travel
+        started = time.time()
+        base = render_main(PANEL_NAMES.index("travel"))
+        kind, _, val = action.partition(":")
+        want = val == "on"
+        if kind == "tr_speedify":
+            label, fn = ("Connecting Speedify…" if want else "Disconnecting…"), lambda: set_speedify_connected(want)
+        elif kind == "tr_ranch":
+            label, fn = ("Starting ranch tunnel…" if want else "Restoring normal exit…"), lambda: set_ranch_exit(want)
+        else:
+            label, fn = "Updating Speedify…", lambda: set_speedify_cell_priority(want)
+
+        def work():
+            return fn(), get_travel_status()
+
+        got = run_with_spinner(base, lambda: f"{label} {int(time.time() - started)}s",
+                               work, ACCENT["travel"], min_visible=0.8)
+        if not got:
+            return "Couldn't read the travel state back"
+        ok, travel = got
+        refresher.put("travel", travel)
+        if ok:
+            return None
+        if kind == "tr_speedify":
+            return f"Speedify didn't {'connect' if want else 'disconnect'} within {TRAVEL_CONNECT_TIMEOUT}s"
+        if kind == "tr_ranch":
+            return "homeip reported an error -- check the router log"
+        return "Speedify didn't take the cellular setting"
 
     def run_openclash_action(action):
         """Runs a confirmed OpenClash action under a spinner over the
@@ -6509,6 +6777,7 @@ def mode_live():
                     sim = refresher.get("sim", sim)
                     oc = refresher.get("oc", oc)
                     traf = refresher.get("traf", traf)
+                    travel = refresher.get("travel", travel)
                     wx = refresher.get("wx", wx)
                     aq = refresher.get("aq", aq)
                     sms_messages = refresher.get("sms", sms_messages)
@@ -6593,6 +6862,8 @@ def mode_live():
                             zone = hit_main_weather(down_x, down_y)
                         elif name == "games":
                             zone = hit_main_games(down_x, down_y)
+                        elif name == "travel":
+                            zone = hit_main_travel(down_x, down_y)
                         elif name == "monitor":
                             zone = hit_main_monitor(down_x, down_y)
 
@@ -6671,6 +6942,12 @@ def mode_live():
                             new_view = "wireguard"
                         elif name == "sim" and zone == "data_cap":
                             new_view = "datacap"
+                        elif name == "travel" and zone:
+                            blocked = travel_confirm(zone)
+                            if blocked:
+                                show_notice(blocked)
+                            else:
+                                new_view = "confirm"
                         elif name == "openclash" and zone in ("toggle", "flush_dns"):
                             blocked = openclash_confirm(zone)
                             if blocked:
@@ -6926,8 +7203,14 @@ def mode_live():
                         write_frame(cur_img)
                         last_draw = now
                 elif view == "confirm" and is_tap and hit_confirm(down_x, down_y) == "yes":
-                    if is_sim_toggle_action(confirm_action) or is_openclash_action(confirm_action):
-                        apply_fn = run_sim_toggle if is_sim_toggle_action(confirm_action) else run_openclash_action
+                    if (is_sim_toggle_action(confirm_action) or is_openclash_action(confirm_action)
+                            or is_travel_action(confirm_action)):
+                        if is_sim_toggle_action(confirm_action):
+                            apply_fn = run_sim_toggle
+                        elif is_travel_action(confirm_action):
+                            apply_fn = run_travel_action
+                        else:
+                            apply_fn = run_openclash_action
                         message = apply_fn(confirm_action)
                         if message:
                             show_notice(message)
