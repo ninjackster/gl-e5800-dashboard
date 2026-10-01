@@ -3432,7 +3432,9 @@ BL_SAVED = "/root/dashboard/.backlight_saved"
 SHADE_PULL_ZONE = 40          # a drag must start in the header strip
 SHADE_OPEN_PX = 90            # how far to pull before it opens
 SHADE_SLIDER = (40, 78, W - 48, 98)
-SHADE_SCREEN_OFF = (16, 140, W - 16, 176)
+SHADE_DIM_SEG = (16, 152, W - 16, 178)
+SHADE_DIM_CHOICES = [(0, "Off"), (15, "15s"), (30, "30s"), (60, "1m"), (300, "5m")]
+SHADE_SCREEN_OFF = (16, 198, W - 16, 234)
 SHADE_HANDLE_Y = H - 34
 BRIGHTNESS_MIN_PCT = 8
 
@@ -3470,7 +3472,7 @@ def _icon_sun_small(d, cx, cy, r, color):
                 cx + math.cos(a) * r, cy + math.sin(a) * r], fill=color, width=2)
 
 
-def panel_shade(pct):
+def panel_shade(pct, dim_after=30):
     img, d = new_canvas()
     accent = ACCENT["clock"]
     glass(d, [0, 0, W, H], radius=0, dim=0.55)
@@ -3488,7 +3490,14 @@ def panel_shade(pct):
         kx = x0 + (x1 - x0) * pct / 100
         d.rounded_rectangle([x0, cy - 4, kx, cy + 4], radius=4, fill=accent)
         d.ellipse([kx - 10, cy - 10, kx + 10, cy + 10], fill=(255, 255, 255))
-    d.line([16, 122, W - 16, 122], fill=LINE)
+    d.line([16, 118, W - 16, 118], fill=LINE)
+    d.text((16, 128), "Auto-dim", font=font("default_medium", 14), fill=FG)
+    sx0, sy0, sx1, sy1 = SHADE_DIM_SEG
+    vals = [v for v, _ in SHADE_DIM_CHOICES]
+    sel = vals.index(dim_after) if dim_after in vals else -1
+    draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, [l for _, l in SHADE_DIM_CHOICES],
+                   sel if sel >= 0 else 0, accent if sel >= 0 else DIM, fsize=12)
+    d.line([16, 188, W - 16, 188], fill=LINE)
     bx0, by0, bx1, by1 = SHADE_SCREEN_OFF
     glass(d, [bx0, by0, bx1, by1], radius=10, outline=SURFACE_EDGE)
     centered_text_box(d, bx0, by0, bx1, by1, "Screen off  ·  power button wakes", font("default_medium", 13), FG)
@@ -3506,6 +3515,10 @@ def hit_shade(x, y):
     x0, y0, x1, y1 = SHADE_SLIDER
     if y0 - 16 <= y <= y1 + 16 and x0 - 24 <= x <= x1 + 24:
         return "slider"
+    sx0, sy0, sx1, sy1 = SHADE_DIM_SEG
+    if sx0 <= x <= sx1 and sy0 - 6 <= y <= sy1 + 6:
+        i = min(len(SHADE_DIM_CHOICES) - 1, max(0, int((x - sx0) / ((sx1 - sx0) / len(SHADE_DIM_CHOICES)))))
+        return f"dim:{SHADE_DIM_CHOICES[i][0]}"
     bx0, by0, bx1, by1 = SHADE_SCREEN_OFF
     if bx0 <= x <= bx1 and by0 <= y <= by1:
         return "screen_off"
@@ -6491,7 +6504,7 @@ def mode_preview(outdir):
         ("net_tethering", panel_tethering(get_networks_state(), get_otg_state())),
         ("net_tethering_receive", panel_tethering(get_networks_state(), dict(get_otg_state(), role="host"))),
         ("cellular", panel_cellular((get_cellular_detail(), time.sleep(0.2), get_cellular_detail())[2])),
-        ("shade", panel_shade(get_brightness_pct())),
+        ("shade", panel_shade(get_brightness_pct(), int(cfg.get("dim_after_s", 30) or 0))),
         ("devices", panel_devices(get_devices() or [
             {"name": "Mac", "ip": "192.168.2.165", "iface": "5G", "down": 1800000, "up": 90000},
             {"name": "iPhone", "ip": "192.168.2.120", "iface": "5G", "down": 42000, "up": 9000}])),
@@ -6821,7 +6834,11 @@ def mode_live():
     # to dim_pct of the user's level; the first touch only restores it (it is
     # swallowed, so it can't press anything). 0 in config disables.
     dim = _DIM
-    DIM_AFTER = float(cfg.get("dim_after_s", 30) or 0)
+    def dim_after():
+        try:
+            return float(cfg.get("dim_after_s", 30) or 0)
+        except (TypeError, ValueError):
+            return 30.0
     DIM_PCT = int(cfg.get("dim_pct", 20) or 20)
 
     def _bl_read():
@@ -7211,7 +7228,7 @@ def mode_live():
             if want != shade_pct:
                 got = set_brightness_pct(want)
                 shade_pct = got if got is not None else shade_pct
-                write_frame(panel_shade(shade_pct))
+                write_frame(panel_shade(shade_pct, int(dim_after())))
         elif released:
             is_tap = (have_pos and abs(release_dx) <= TAP_JITTER_PX
                       and abs(release_dy) <= TAP_JITTER_PX)
@@ -7220,14 +7237,20 @@ def mode_live():
                 close()
             elif is_tap and zone == "close":
                 close()
+            elif is_tap and zone and zone.startswith("dim:"):
+                cfg["dim_after_s"] = int(zone.split(":")[1])
+                save_config(cfg)
+                with touch_state.lock:
+                    touch_state.last_touch = time.time()
+                write_frame(panel_shade(shade_pct, int(dim_after())))
             elif is_tap and zone == "screen_off":
                 close()
                 run(["/root/dashboard/screen_sleep.sh", "off"], timeout=5)
             elif zone == "slider":
-                write_frame(panel_shade(shade_pct))
+                write_frame(panel_shade(shade_pct, int(dim_after())))
         elif sub_dirty:
             shade_pct = get_brightness_pct()
-            write_frame(panel_shade(shade_pct))
+            write_frame(panel_shade(shade_pct, int(dim_after())))
             sub_dirty = False
 
     def handle_sms_scroll(now):
@@ -7650,11 +7673,11 @@ def mode_live():
             if _bl_read() not in (dim["level"], 0):
                 # brightness changed elsewhere (power-button wake, GL): stand down
                 dim.update(on=False, restore=None, level=None)
-        elif DIM_AFTER > 0 and view not in ("speedtest", "game"):
+        elif dim_after() > 0 and view not in ("speedtest", "game"):
             with touch_state.lock:
                 idle_for = now - touch_state.last_touch
                 touching = touch_state.active
-            if not touching and idle_for > DIM_AFTER:
+            if not touching and idle_for > dim_after():
                 dim_screen()
 
         if now - last_switch_req_check > 0.3:
@@ -7760,7 +7783,7 @@ def mode_live():
                                   and abs(dy) > abs(dx) and drag_strip is None):
                     if not shade_pull:
                         shade_pull = True
-                        shade_img = panel_shade(get_brightness_pct())
+                        shade_img = panel_shade(get_brightness_pct(), int(dim_after()))
                     if released or not active:
                         shade_pull = False
                         state = "idle"
