@@ -2931,6 +2931,15 @@ def run_with_spinner(base_img, label, fn, accent=None, min_visible=0.4, fps=30):
 
 # ---------- widgets ----------
 
+
+def list_layer(top, list_h):
+    """Background for a scrolling list: the matching strip of the wallpaper
+    (so the list sits on the photo like the rest of the screen), or the flat
+    background when there is no wallpaper."""
+    if WALLPAPER is not None:
+        return WALLPAPER.crop((0, int(top), W, int(top) + int(list_h)))
+    return Image.new("RGB", (W, int(list_h)), BG)
+
 def new_canvas():
     img = WALLPAPER.copy() if WALLPAPER is not None else Image.new("RGB", (W, H), BG)
     return img, ImageDraw.Draw(img)
@@ -3836,19 +3845,7 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_acti
         caption = "tap to set a limit"
     centered_text(d, W / 2, 228, caption, font("default_medium", 11), DIM)
 
-    wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
-    glass(d, [wx0, wy0, wx1, wy1], radius=10, outline=SURFACE_EDGE)
-    _icon_shield(d, wx0 + 24, (wy0 + wy1) / 2, 11, ACCENT["sim"])
-    peers = wg_peers or []
-    active = next((p["name"] for p in peers if p["id"] == wg_active), None)
-    d.text((wx0 + 44, wy0 + 4), "WireGuard", font=font("default_bold", 13), fill=FG)
-    if active:
-        sub = f"On · {active}"
-    elif peers:
-        sub = "Off"
-    else:
-        sub = "No configs · add in LuCI"
-    d.text((wx0 + 44, wy0 + 20), sub, font=font("default_medium", 10), fill=DIM)
+    # Fork: WireGuard moved off this page to the Home badge.
 
     draw_page_dots(d, PANEL_NAMES.index("sim"))
     return img
@@ -4511,7 +4508,7 @@ def panel_repeater(rep, networks, scroll_px=0, connecting_ssid=None, spin_phase=
     # old fixed-row fit-to-screen approach, which silently dropped any
     # networks past whatever fit in the available height.
     list_h = REPEATER_LIST_BOTTOM - REPEATER_LIST_TOP
-    list_img = Image.new("RGB", (W, list_h), BG)
+    list_img = list_layer(REPEATER_LIST_TOP, list_h)
     ld = ImageDraw.Draw(list_img)
     for i, ap in enumerate(networks):
         y0 = i * REPEATER_ROW_H - scroll_px
@@ -4571,7 +4568,7 @@ def panel_sms(messages, scroll_px=0):
         return img
 
     list_h = SMS_LIST_BOTTOM - SMS_LIST_TOP
-    list_img = Image.new("RGB", (W, list_h), BG)
+    list_img = list_layer(SMS_LIST_TOP, list_h)
     ld = ImageDraw.Draw(list_img)
     f_sender = font("default_bold", 14)
     f_time = font("default_medium", 11)
@@ -4787,7 +4784,7 @@ def panel_wireguard(peers, active_id, scroll_px=0, filter_country=None):
     # list is, so this scales to hundreds of peers without hundreds of
     # draw calls per frame.
     list_h = WIREGUARD_LIST_BOTTOM - WIREGUARD_LIST_TOP
-    list_img = Image.new("RGB", (W, list_h), BG)
+    list_img = list_layer(WIREGUARD_LIST_TOP, list_h)
     ld = ImageDraw.Draw(list_img)
     for i, peer in enumerate(visible):
         y0 = i * WIREGUARD_ROW_H - scroll_px
@@ -5554,7 +5551,7 @@ def panel_scroll_picker(title, accent, items, selected, scroll_px, font_name="de
     draw_back_header(d, title, accent)
 
     list_h = PICKER_BOTTOM - PICKER_TOP
-    list_img = Image.new("RGB", (W, list_h), BG)
+    list_img = list_layer(PICKER_TOP, list_h)
     ld = ImageDraw.Draw(list_img)
     f = font(font_name, SCROLL_FONT_SIZE)
     check_f = font("default_medium", SCROLL_FONT_SIZE)  # CJK fonts may lack a ✓ glyph
@@ -5664,7 +5661,10 @@ def hit_main_clock(x, y):
         return "more"
     sx0, sy0, sx1, sy1 = STATUS_BADGES
     if sx0 <= x <= sx1 and sy0 <= y <= sy1:
-        return "status"
+        # same 2x2 grid as draw_status_badges: Speedify, Home IP / WireGuard, Tailscale
+        col = 0 if x < (sx0 + sx1) / 2 else 1
+        row = 0 if y < (sy0 + sy1) / 2 else 1
+        return ("badge_speedify", "badge_ranch", "wireguard", "badge_tailscale")[row * 2 + col]
     lx0, ly0, lx1, ly1 = CLOCK_LEFT_ZONE
     if lx0 <= x < lx1 and ly0 <= y < ly1:
         return "city_left"
@@ -5709,10 +5709,7 @@ def hit_main_sim(x, y):
     rx0, ry0, rx1, ry1 = SIM_ROAM_TOGGLE_RECT
     if dx0 - 8 <= x <= rx1 + 12 and SIM_TOGGLE_LABEL_Y - 4 <= y <= dy1 + 4:
         return "data_toggle" if x < (dx1 + rx0) / 2 else "roam_toggle"
-    wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
-    if wx0 <= x <= wx1 and wy0 <= y <= wy1:
-        return "wireguard"
-    if 156 <= y < wy0:
+    if 156 <= y < SIM_WIREGUARD_TILE[1]:
         return "data_cap"
     return None
 
@@ -7019,7 +7016,12 @@ def mode_live():
                             wifi24 = get_wifi_radio_state("wifi2g")
                             wifi_band = get_wifi_band_state()
                             rep = get_repeater_status()
-                        elif name == "clock" and zone == "status":
+                        elif name == "clock" and zone == "badge_tailscale":
+                            show_notice("Pick or clear an exit node in the GL.iNet app")
+                            cur_img = render_main(panel_idx)
+                            write_frame(cur_img)
+                            last_draw = now
+                        elif name == "clock" and zone in ("badge_speedify", "badge_ranch"):
                             panel_idx = PANEL_NAMES.index("travel")
                             cur_img = render_main(panel_idx)
                             write_frame(cur_img)
@@ -7060,7 +7062,7 @@ def mode_live():
                                 show_notice(blocked)
                             else:
                                 new_view = "confirm"
-                        elif name == "sim" and zone == "wireguard":
+                        elif name == "clock" and zone == "wireguard":
                             # Wrapped in the spinner like the other slow
                             # actions: get_wireguard_peers is now a single
                             # uci call (was one per peer), but "hundreds
