@@ -3458,6 +3458,27 @@ def _signal_quality(rsrp):
     return "Weak", (240, 90, 90)
 
 
+
+def _band_label(band):
+    b = str(band or "").lower()
+    if not b:
+        return None
+    if "6" in b:
+        return "6 GHz"
+    if "5" in b:
+        return "5 GHz"
+    if "2" in b:
+        return "2.4 GHz"
+    return None
+
+
+def _wifi_signal_color(dbm):
+    if dbm >= -60:
+        return (70, 240, 170)
+    if dbm >= -72:
+        return (240, 180, 80)
+    return (240, 90, 90)
+
 def net_row_subtitle(r):
     if r["key"] == "wan" and not r.get("carrier") and not r["up"]:
         return "No cable"
@@ -3486,10 +3507,25 @@ def panel_networks(net, rep=None):
         d.ellipse([22 - 4, cy - 4, 22 + 4, cy + 4], fill=dot)
         d.text((36, y0 + 8), r["label"], font=font("default_bold", 15), fill=FG)
         sub = net_row_subtitle(r)
-        if r["key"] == "wwan" and r["up"] and rep and rep.get("ssid"):
-            sub = rep["ssid"]
         f_sub = font("default_medium", 11)
-        d.text((36, y0 + 28), truncate_to_width(d, sub, f_sub, 120), font=f_sub, fill=DIM)
+        if r["key"] == "wwan" and r["up"] and rep and rep.get("ssid"):
+            # Repeater: band beside the label, signal after the SSID, so it can
+            # be compared with cellular at a glance.
+            band = _band_label(rep.get("band"))
+            if band:
+                lx = 36 + d.textlength(r["label"], font=font("default_bold", 15)) + 8
+                d.text((lx, y0 + 11), band, font=font("default_medium", 11), fill=DIM)
+            sig = rep.get("signal")
+            if isinstance(sig, (int, float)) and sig < 0:
+                ssid = truncate_to_width(d, rep["ssid"], f_sub, 74)
+                d.text((36, y0 + 28), ssid, font=f_sub, fill=DIM)
+                sx = 36 + d.textlength(ssid, font=f_sub) + 6
+                d.text((sx, y0 + 28), f"{sig:.0f} dBm", font=font("default_bold", 11), fill=_wifi_signal_color(sig))
+                sub = None
+            else:
+                sub = rep["ssid"]
+        if sub:
+            d.text((36, y0 + 28), truncate_to_width(d, sub, f_sub, 120), font=f_sub, fill=DIM)
         if r["active"]:
             f_tag = font("default_bold", 10)
             tw = d.textlength("ACTIVE", font=f_tag)
