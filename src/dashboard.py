@@ -3249,7 +3249,7 @@ def draw_tile(d, x0, y0, x1, y1, icon_fn, label, subtitle, accent):
         centered_text(d, cx, y0 + 78, text, f, DIM)
 
 
-def draw_sparkline(d, x, y, w, h, points, color):
+def draw_sparkline(d, x, y, w, h, points, color, fmt="{:.3f}"):
     """points: list of (label, value), oldest first. Thin line + a faint fill
     under it, a highlighted end dot on the latest value, min/max as direct
     labels in muted ink (not the series colour) rather than a dense axis."""
@@ -3280,9 +3280,9 @@ def draw_sparkline(d, x, y, w, h, points, color):
     d.ellipse([ex - 3, ey - 3, ex + 3, ey + 3], fill=color)
 
     f = font("default_medium", 10)
-    d.text((x, y), f"{vmax:.3f}", font=f, fill=DIM)
-    bbox = d.textbbox((0, 0), f"{vmin:.3f}", font=f)
-    d.text((x, y + h - (bbox[3] - bbox[1]) - 2), f"{vmin:.3f}", font=f, fill=DIM)
+    d.text((x, y), fmt.format(vmax), font=f, fill=DIM)
+    bbox = d.textbbox((0, 0), fmt.format(vmin), font=f)
+    d.text((x, y + h - (bbox[3] - bbox[1]) - 2), fmt.format(vmin), font=f, fill=DIM)
 
 
 # ---------- layout constants (shared by drawing and hit-testing) ----------
@@ -3326,6 +3326,290 @@ OC_UPDATE_BUTTON = (124, 250, W - 16, 280)
 WEATHER_CITY_ZONE = (34, 66)
 
 PICKER_TOP, PICKER_BOTTOM = 38, 316
+
+# ---------- networks (fork) ----------
+#
+# Home's "Networks" tile: every WAN the Mudi can use, in failover priority
+# order, each opening its own detail. Priority comes from kmwan's metrics,
+# which also drive the kernel's static route metrics; with kmwan's health
+# checks off (see the KB), only link-down failover happens.
+
+NET_WANS = [
+    # key, label, ubus interface
+    ("wan", "Ethernet", "wan"),
+    ("wwan", "Repeater", "wwan"),
+    ("tethering", "Tethering", "tethering"),
+    ("modem_cpu", "Cellular", "modem_cpu"),
+]
+NET_ROW_TOP, NET_ROW_H, NET_ROW_GAP = 40, 50, 5
+NET_FAILOVER_Y = 262
+NET_TOGGLE_RECT = (172, 42, 218, 64)
+CELL_RECONNECT_RECT = (16, 278, 116, 306)
+CELL_SIM_RECT = (124, 278, W - 16, 306)
+CELL_HISTORY_MAX = 120      # 5s refresher ticks -> 10 minutes
+_cell_history = []
+
+
+def _fmt_uptime(sec):
+    if sec is None:
+        return "—"
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60:02d}s"
+    if sec < 86400:
+        return f"{sec // 3600}h {(sec % 3600) // 60:02d}m"
+    return f"{sec // 86400}d {(sec % 86400) // 3600}h"
+
+
+def get_networks_state():
+    """One dict per WAN: present/up/ip/gateway/dns/uptime/device/active and
+    its failover priority; plus whether kmwan's health checks are on."""
+    active_dev = get_wan_iface()
+    rows = []
+    for key, label, iface in NET_WANS:
+        st = ubus_call(f"network.interface.{iface}", "status")
+        present = bool(st)
+        dev = st.get("l3_device") or st.get("device")
+        ip = next((a.get("address") for a in st.get("ipv4-address", [])), None)
+        gw = next((r.get("nexthop") for r in st.get("route", []) if r.get("target") == "0.0.0.0"), None)
+        dns = st.get("dns-server") or []
+        try:
+            metric = int(uci_get(f"kmwan.{key}.metric", "99"))
+        except ValueError:
+            metric = 99
+        row = {"key": key, "label": label, "iface": iface, "present": present,
+               "up": bool(st.get("up")), "device": dev, "ip": ip, "gateway": gw,
+               "dns": dns, "uptime": st.get("uptime") if st.get("up") else None,
+               "active": bool(dev) and dev == active_dev, "metric": metric}
+        if key == "wan":
+            row["carrier"] = _read_sys("/sys/class/net/eth0/carrier") == "1"
+        rows.append(row)
+    rows.sort(key=lambda r: r["metric"])
+    return {"rows": rows, "health_checks": uci_get("kmwan.global.enable", "0") == "1"}
+
+
+def get_cellular_detail():
+    """Live cellular connection detail for the Cellular screen. Also appends
+    to the 10-minute RSRP/SINR history used for positioning the Mudi."""
+    modem = ubus_call("cellular.modem", "status", {"bus": "cpu"})
+    try:
+        slot = int(modem.get("current_sim_slot", 1))
+    except (TypeError, ValueError):
+        slot = 1
+    raw = ubus_call("cellular.network", "cell_info", {"bus": "cpu", "slot": slot})
+    info = ubus_call("cellular.network", "info", {"bus": "cpu", "slot": slot})
+    net = next(iter(info.get("networks") or []), {}) or {}
+    sig = [s for s in (raw.get("signal") or []) if _cell_int(s.get("band")) and _cell_int(s.get("network_type"))]
+    prim = sorted(sig, key=lambda s: _cell_int(s.get("ca")) or 0)[0] if sig else {}
+    iface = ubus_call("network.interface.modem_cpu", "status")
+    ipv4 = net.get("ipv4") or {}
+    det = {
+        "registered": bool(prim),
+        "rsrp": _cell_int(prim.get("rsrp")), "rsrq": _cell_int(prim.get("rsrq")),
+        "sinr": _cell_int(prim.get("sinr")), "pci": _cell_int(prim.get("pci")),
+        "cell_id": raw.get("cell_id"), "slot": slot,
+        "carrier": net.get("carrier"), "apn": net.get("apn"),
+        "ip": ipv4.get("ip"), "gateway": ipv4.get("gateway"), "dns": ipv4.get("dns") or [],
+        "up": bool(iface.get("up")), "uptime": iface.get("uptime") if iface.get("up") else None,
+        "cell": _parse_cell_signal(raw) if "signal" in raw else {},
+    }
+    if det["rsrp"] is not None and det["rsrp"] > -200:
+        _cell_history.append((time.time(), det["rsrp"], det["sinr"]))
+        del _cell_history[:-CELL_HISTORY_MAX]
+    det["history"] = list(_cell_history)
+    return det
+
+
+def set_wan_iface_up(iface, up):
+    """Bring a WAN up or down until the next reboot or network reload."""
+    run(["ifup" if up else "ifdown", iface], timeout=20)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if bool(ubus_call(f"network.interface.{iface}", "status").get("up")) == up:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def reconnect_cellular():
+    """Redial the cellular data session and wait for it to come back."""
+    run(["ifup", "modem_cpu"], timeout=20)
+    deadline = time.time() + 60
+    time.sleep(3)
+    while time.time() < deadline:
+        st = ubus_call("network.interface.modem_cpu", "status")
+        if st.get("up"):
+            return True
+        time.sleep(1.5)
+    return False
+
+
+def _signal_quality(rsrp):
+    if rsrp is None:
+        return "No signal", DIM
+    if rsrp >= -80:
+        return "Excellent", (70, 240, 170)
+    if rsrp >= -95:
+        return "Good", (70, 240, 170)
+    if rsrp >= -105:
+        return "Fair", (240, 180, 80)
+    return "Weak", (240, 90, 90)
+
+
+def net_row_subtitle(r):
+    if r["key"] == "wan" and not r.get("carrier") and not r["up"]:
+        return "No cable"
+    if r["key"] == "tethering" and not r["present"]:
+        return "No phone plugged in"
+    if r["up"]:
+        return r["ip"] or "Up"
+    return "Down" if r["present"] else "Not set up"
+
+
+def panel_networks(net, rep=None):
+    img, d = new_canvas()
+    accent = ACCENT["clock"]
+    draw_back_header(d, "Networks", accent)
+    for i, r in enumerate(net["rows"]):
+        y0 = NET_ROW_TOP + i * (NET_ROW_H + NET_ROW_GAP)
+        box = [8, y0, W - 8, y0 + NET_ROW_H]
+        glass(d, box, radius=10, outline=accent if r["active"] else SURFACE_EDGE, width=2 if r["active"] else 1)
+        if r["up"]:
+            dot = (70, 240, 170)
+        elif r["present"] and (r["key"] != "wan" or r.get("carrier")):
+            dot = (240, 180, 80)
+        else:
+            dot = OFF
+        cy = y0 + NET_ROW_H / 2
+        d.ellipse([22 - 4, cy - 4, 22 + 4, cy + 4], fill=dot)
+        d.text((36, y0 + 8), r["label"], font=font("default_bold", 15), fill=FG)
+        sub = net_row_subtitle(r)
+        if r["key"] == "wwan" and r["up"] and rep and rep.get("ssid"):
+            sub = rep["ssid"]
+        f_sub = font("default_medium", 11)
+        d.text((36, y0 + 28), truncate_to_width(d, sub, f_sub, 120), font=f_sub, fill=DIM)
+        if r["active"]:
+            f_tag = font("default_bold", 10)
+            tw = d.textlength("ACTIVE", font=f_tag)
+            tx1 = W - 30
+            d.rounded_rectangle([tx1 - tw - 14, cy - 9, tx1, cy + 9], radius=9, fill=accent)
+            d.text((tx1 - tw - 7, cy - 7), "ACTIVE", font=f_tag, fill=BG)
+        d.text((W - 22, cy - 11), "›", font=font("default_bold", 18), fill=DIM)
+    order = " › ".join(r["label"] for r in net["rows"])
+    centered_text(d, W / 2, NET_FAILOVER_Y, "Failover order", font("default_medium", 11), DIM)
+    centered_text(d, W / 2, NET_FAILOVER_Y + 16, order, font("default_bold", 11), FG)
+    checks = "Health checks on" if net["health_checks"] else "Link-down only · health checks off"
+    centered_text(d, W / 2, NET_FAILOVER_Y + 34, checks, font("default_medium", 10), DIM)
+    return img
+
+
+def hit_networks(x, y, net):
+    for i, r in enumerate(net["rows"]):
+        y0 = NET_ROW_TOP + i * (NET_ROW_H + NET_ROW_GAP)
+        if 8 <= x <= W - 8 and y0 <= y <= y0 + NET_ROW_H:
+            return r["key"]
+    return None
+
+
+def panel_net_detail(net, key):
+    r = next((r for r in net["rows"] if r["key"] == key), None)
+    img, d = new_canvas()
+    accent = ACCENT["clock"]
+    draw_back_header(d, r["label"] if r else "Network", accent)
+    if not r:
+        return img
+    d.text((16, 44), "Connection", font=font("default_medium", 16), fill=FG)
+    if r["present"] or r["up"]:
+        tx0, ty0, tx1, ty1 = NET_TOGGLE_RECT
+        draw_toggle(d, tx0, ty0, r["up"], accent, w=tx1 - tx0, h=ty1 - ty0)
+    d.line([16, 76, W - 16, 76], fill=LINE)
+    if key == "tethering" and not r["present"]:
+        for i, line in enumerate(wrap_text_to_lines(
+                d, "No phone connected. Plug an iPhone or Android in over USB and turn on Personal Hotspot or USB tethering.",
+                font("default_medium", 13), W - 40)):
+            centered_text(d, W / 2, 110 + i * 19, line, font("default_medium", 13), DIM)
+        return img
+    if key == "wan" and not r.get("carrier"):
+        centered_text(d, W / 2, 90, "No cable detected", font("default_medium", 13), (240, 180, 80))
+    rows = [("Status", ("Up" if r["up"] else "Down") + (" · active" if r["active"] else "")),
+            ("IP", r["ip"] or "—"), ("Gateway", r["gateway"] or "—"),
+            ("DNS", ", ".join(r["dns"][:2]) or "—"), ("Uptime", _fmt_uptime(r["uptime"])),
+            ("Device", r["device"] or "—"), ("Priority", str(net["rows"].index(r) + 1))]
+    y = 112
+    for k, v in rows:
+        d.text((16, y), k, font=font("default_medium", 13), fill=DIM)
+        f_v = font("default_medium", 13)
+        v = truncate_to_width(d, v, f_v, W - 110)
+        d.text((W - 16 - d.textlength(v, font=f_v), y), v, font=f_v, fill=FG)
+        y += 26
+    centered_text(d, W / 2, H - 22, "Toggle lasts until reboot", font("default_medium", 10), DIM)
+    return img
+
+
+def hit_net_detail(x, y):
+    tx0, ty0, tx1, ty1 = NET_TOGGLE_RECT
+    if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
+        return "toggle"
+    return None
+
+
+def panel_cellular(det):
+    img, d = new_canvas()
+    accent = ACCENT["sim"]
+    draw_back_header(d, "Cellular", accent)
+    if not det or not det.get("registered"):
+        centered_text(d, W / 2, 130, "Not registered", font("default_medium", 15), DIM)
+    else:
+        qual, qcol = _signal_quality(det["rsrp"])
+        d.text((16, 42), f"{det['rsrp']}", font=font("default_mono_medium", 34), fill=FG)
+        d.text((16 + d.textlength(f"{det['rsrp']}", font=font("default_mono_medium", 34)) + 6, 60),
+               "dBm", font=font("default_medium", 12), fill=DIM)
+        d.text((16, 84), qual, font=font("default_bold", 13), fill=qcol)
+        f_s = font("default_medium", 12)
+        sinr = det["sinr"] if det["sinr"] is not None else "—"
+        rsrq = det["rsrq"] if det["rsrq"] is not None else "—"
+        d.text((W - 16 - d.textlength(f"SINR {sinr} dB", font=f_s), 50), f"SINR {sinr} dB", font=f_s, fill=FG)
+        d.text((W - 16 - d.textlength(f"RSRQ {rsrq} dB", font=f_s), 68), f"RSRQ {rsrq} dB", font=f_s, fill=FG)
+        hist = det.get("history") or []
+        pts = [("", v) for _, v, _ in hist]
+        draw_sparkline(d, 16, 102, W - 32, 62, pts, accent, fmt="{:.0f} dBm")
+        centered_text(d, W / 2, 166, "signal, last 10 min · move the Mudi to improve", font("default_medium", 10), DIM)
+        bands = " + ".join(c["band"] for c in (det.get("cell") or {}).get("carriers", [])) or "—"
+        rows = [("Carrier", f"{det['carrier'] or '—'} · {bands}"), ("APN", det["apn"] or "—"),
+                ("IP", det["ip"] or "—"), ("Session up", _fmt_uptime(det["uptime"]))]
+        y = 184
+        for k, v in rows:
+            d.text((16, y), k, font=font("default_medium", 12), fill=DIM)
+            f_v = font("default_medium", 12)
+            v = truncate_to_width(d, str(v), f_v, W - 110)
+            d.text((W - 16 - d.textlength(v, font=f_v), y), v, font=f_v, fill=FG)
+            y += 22
+    rx0, ry0, rx1, ry1 = CELL_RECONNECT_RECT
+    d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=accent, width=2)
+    centered_text_box(d, rx0, ry0, rx1, ry1, "Reconnect", font("default_bold", 13), accent)
+    sx0, sy0, sx1, sy1 = CELL_SIM_RECT
+    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=8, fill=accent)
+    centered_text_box(d, sx0, sy0, sx1, sy1, "SIM settings ›", font("default_bold", 13), BG)
+    return img
+
+
+def hit_cellular(x, y):
+    for zone, (x0, y0, x1, y1) in (("reconnect", CELL_RECONNECT_RECT), ("sim", CELL_SIM_RECT)):
+        if x0 - 3 <= x <= x1 + 3 and y0 - 6 <= y <= y1 + 6:
+            return zone
+    return None
+
+
+def _icon_globe(d, cx, cy, r, color):
+    w = max(2, int(r * 0.13))
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=w)
+    d.ellipse([cx - r * 0.45, cy - r, cx + r * 0.45, cy + r], outline=color, width=w)
+    d.line([cx - r, cy, cx + r, cy], fill=color, width=w)
+    d.line([cx - r * 0.86, cy - r * 0.5, cx + r * 0.86, cy - r * 0.5], fill=color, width=w)
+    d.line([cx - r * 0.86, cy + r * 0.5, cx + r * 0.86, cy + r * 0.5], fill=color, width=w)
+
 
 # ---------- travel: Speedify bonding + ranch home-IP exit ----------
 #
@@ -3564,10 +3848,15 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None, t
 
     d.line([16, 120, W - 16, 120], fill=LINE)
 
-    rep_sub = rep["ssid"] if rep["connected"] else "Not connected"
+    # Fork: the Repeater tile is now Networks; its subtitle names the
+    # connection carrying traffic right now.
+    if conn_type == "Repeater" and rep.get("connected"):
+        net_sub = rep["ssid"]
+    else:
+        net_sub = conn_type or "Offline"
     draw_tile(d, *REPEATER_TILE,
-              lambda dd, cx, cy, r, ac: _icon_wifi_signal(dd, cx, cy, r, ac),
-              "Repeater", rep_sub, ACCENT["clock"])
+              lambda dd, cx, cy, r, ac: _icon_globe(dd, cx, cy, r * 0.85, ac),
+              "Networks", net_sub, ACCENT["clock"])
     draw_tile(d, *MORE_TILE,
               lambda dd, cx, cy, r, ac: _icon_settings_gear(dd, cx, cy, r, ac),
               "More", "Settings", ACCENT["clock"])
@@ -5854,6 +6143,10 @@ def mode_preview(outdir):
         ("sms", panel_sms(sms_messages or _DEMO_SMS_MESSAGES)),
         ("sms_detail", panel_sms_detail((sms_messages or _DEMO_SMS_MESSAGES)[0])),
         ("wireguard", panel_wireguard(wg_peers, wg_active)),
+        ("networks", panel_networks(get_networks_state(), rep)),
+        ("net_wan", panel_net_detail(get_networks_state(), "wan")),
+        ("net_tethering", panel_net_detail(get_networks_state(), "tethering")),
+        ("cellular", panel_cellular((get_cellular_detail(), time.sleep(0.2), get_cellular_detail())[2])),
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
@@ -6096,6 +6389,9 @@ def mode_live():
     # OpenClash also gets started/stopped from LuCI or the GL app.
     # 5s: Speedify and the ranch tunnel also change from the GL UI and LuCI.
     refresher.add("travel", get_travel_status, 5)
+    # Cellular detail feeds the Cellular screen's 10-minute signal history,
+    # so it keeps sampling even while that screen isn't open.
+    refresher.add("celldet", get_cellular_detail, 5)
     refresher.add("sms", get_sms_messages, 15)
     refresher.add("rep", get_repeater_status, 30)
     refresher.add("wg_peers", get_wireguard_peers, 120)
@@ -6126,6 +6422,9 @@ def mode_live():
     oc = openclash_status_empty(openclash_installed())
     traf = openclash_traffic_empty()
     travel = travel_status_empty(travel_installed())
+    net = {"rows": [], "health_checks": False}
+    net_detail_key = None
+    cell_det = {}
     wx, aq = [], []
     sms_messages = []
     wg_peers, wg_active = [], None
@@ -6393,7 +6692,7 @@ def mode_live():
         password, or the disconnect zone above the (unscrolled) list can
         fire instead of anything in it."""
         nonlocal view, sub_dirty, cur_img, last_draw, picker_scroll_base
-        nonlocal rep, kb_target_ssid, kb_target_bssid, kb_text, kb_layer, kb_caps
+        nonlocal rep, kb_target_ssid, kb_target_bssid, kb_text, kb_layer, kb_caps, net
         nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action, confirm_return_view, confirm_danger
         nonlocal connecting_ssid, connecting_since, last_connect_check, last_spinner_draw
         nonlocal connect_error
@@ -6434,10 +6733,9 @@ def mode_live():
             is_tap = (have_pos and abs(final_dx) <= TAP_JITTER_PX
                       and abs(final_dy) <= TAP_JITTER_PX)
             if is_tap and hit_back(down_y):
-                view = "main"
-                cur_img = render_main(panel_idx)
-                write_frame(cur_img)
-                last_draw = now
+                view = "networks"      # fork: Repeater lives under Networks
+                net = get_networks_state()
+                sub_dirty = True
             elif is_tap:
                 action, val = hit_repeater(down_x, down_y, rep, len(rep_networks), picker_scroll_base)
                 if action == "disconnect":
@@ -6910,6 +7208,7 @@ def mode_live():
                     oc = refresher.get("oc", oc)
                     traf = refresher.get("traf", traf)
                     travel = refresher.get("travel", travel)
+                    cell_det = refresher.get("celldet", cell_det)
                     wx = refresher.get("wx", wx)
                     aq = refresher.get("aq", aq)
                     sms_messages = refresher.get("sms", sms_messages)
@@ -7007,10 +7306,13 @@ def mode_live():
                             new_view = "city_bottom"
                             picker_scroll_base = 0
                         elif name == "clock" and zone == "repeater":
-                            new_view = "repeater"
-                            picker_scroll_base = 0
-                            rep = get_repeater_status()
-                            start_repeater_scan()
+                            # Fork: the tile opens Networks; Repeater is one level down.
+                            got = run_with_spinner(cur_img, "Loading…",
+                                                   lambda: (get_networks_state(), get_repeater_status()),
+                                                   ACCENT["clock"])
+                            if got:
+                                net, rep = got
+                            new_view = "networks"
                         elif name == "clock" and zone == "more":
                             new_view = "more"
                             wifi24 = get_wifi_radio_state("wifi2g")
@@ -7299,7 +7601,13 @@ def mode_live():
                 continue
 
             if sub_dirty:
-                if view == "more":
+                if view == "networks":
+                    img = panel_networks(net, rep)
+                elif view == "net_detail":
+                    img = panel_net_detail(net, net_detail_key)
+                elif view == "cellular":
+                    img = panel_cellular(cell_det)
+                elif view == "more":
                     img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)
                 elif view == "confirm":
                     img = panel_confirm(confirm_title, confirm_message, confirm_accent(),
@@ -7356,6 +7664,23 @@ def mode_live():
                         cur_img = render_main(panel_idx)
                         write_frame(cur_img)
                         last_draw = time.time()
+                    elif confirm_action.startswith("net_toggle:") or confirm_action == "cell_reconnect":
+                        if confirm_action == "cell_reconnect":
+                            base = panel_cellular(cell_det)
+                            ok = run_with_spinner(base, "Redialing…", reconnect_cellular, ACCENT["sim"], min_visible=0.8)
+                            cell_det = get_cellular_detail()
+                            if not ok:
+                                show_notice("Cellular didn't come back within 60s")
+                        else:
+                            _, iface, val = confirm_action.split(":")
+                            base = panel_net_detail(net, net_detail_key)
+                            ok = run_with_spinner(base, "Applying…", lambda: set_wan_iface_up(iface, val == "on"),
+                                                  ACCENT["clock"], min_visible=0.8)
+                            net = get_networks_state()
+                            if not ok:
+                                show_notice(f"{iface} didn't change state within 20s")
+                        view = confirm_return_view
+                        sub_dirty = True
                     elif confirm_action in ("reboot", "shutdown"):
                         kind = confirm_action
                         (reboot_router if kind == "reboot" else shutdown_router)()
@@ -7441,6 +7766,56 @@ def mode_live():
                 elif view == "sms_detail" and is_tap and hit_back(down_y):
                     view = "sms"
                     sub_dirty = True
+                elif is_tap and view in ("net_detail", "cellular") and hit_back(down_y):
+                    view = "networks"
+                    net = get_networks_state()
+                    sub_dirty = True
+                elif is_tap and view == "networks" and not hit_back(down_y):
+                    key = hit_networks(down_x, down_y, net)
+                    if key == "wwan":
+                        picker_scroll_base = 0
+                        rep = get_repeater_status()
+                        start_repeater_scan()
+                        view = "repeater"
+                        sub_dirty = True
+                    elif key == "modem_cpu":
+                        cell_det = get_cellular_detail()
+                        view = "cellular"
+                        sub_dirty = True
+                    elif key:
+                        net_detail_key = key
+                        view = "net_detail"
+                        sub_dirty = True
+                elif is_tap and view == "net_detail" and hit_net_detail(down_x, down_y) == "toggle":
+                    r = next((r for r in net["rows"] if r["key"] == net_detail_key), None)
+                    if r and (r["present"] or r["up"]):
+                        want = not r["up"]
+                        confirm_title = r["label"]
+                        confirm_message = (f"Bring {r['label']} up?" if want else
+                                           f"Take {r['label']} down? If it's carrying traffic, the Mudi fails over to the next connection.")
+                        confirm_yes_label = "Bring up" if want else "Take down"
+                        confirm_danger = not want
+                        confirm_action = f"net_toggle:{r['iface']}:{'on' if want else 'off'}"
+                        confirm_return_view = "net_detail"
+                        view = "confirm"
+                        sub_dirty = True
+                elif is_tap and view == "cellular":
+                    zone = hit_cellular(down_x, down_y)
+                    if zone == "reconnect":
+                        confirm_title = "Cellular"
+                        confirm_message = "Redial the cellular data session? Cellular drops for a few seconds."
+                        confirm_yes_label = "Reconnect"
+                        confirm_danger = False
+                        confirm_action = "cell_reconnect"
+                        confirm_return_view = "cellular"
+                        view = "confirm"
+                        sub_dirty = True
+                    elif zone == "sim":
+                        view = "main"
+                        panel_idx = PANEL_NAMES.index("sim")
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = now
                 elif is_tap and hit_back(down_y):
                     view = "main"
                     cur_img = render_main(panel_idx)
@@ -7528,6 +7903,8 @@ def mode_live():
                     # and swiping a confirm dialog away skipped the screen
                     # that raised it. Mirror the header-tap destination.
                     parent = {"sms_detail": "sms",
+                              "net_detail": "networks",
+                              "cellular": "networks",
                               "keyboard_wifi": "repeater",
                               "confirm": confirm_return_view or "main"}.get(view, "main")
                     if view == "keyboard_wifi":
