@@ -6524,9 +6524,21 @@ def mode_calibrate():
 _stop = False
 
 
+# Fork: auto-dim state lives at module level so a stop/restart while dimmed
+# puts the user's brightness back instead of leaving the panel dim (and
+# screen_sleep.sh then saving the dim level as the user's level).
+_DIM = {"on": False, "restore": None, "level": None}
+
+
 def _on_term(signum, frame):
     global _stop
     _stop = True
+    if _DIM.get("on") and _DIM.get("restore"):
+        try:
+            with open("/sys/class/backlight/soc:backlight/brightness", "w") as f:
+                f.write(str(int(_DIM["restore"])))
+        except Exception:
+            pass
 
 
 # ---------- touch input ----------
@@ -6569,6 +6581,7 @@ class TouchState:
         self.release_dy = 0
         self.release_vx = 0.0
         self.error = None       # set if the input device can't be read
+        self.last_touch = time.time()   # fork: idle auto-dim
 
 
 touch_state = TouchState()
@@ -6630,6 +6643,7 @@ def _touch_reader():
                         down = True
                         start_x = start_y = last_x = None
                         with touch_state.lock:
+                            touch_state.last_touch = time.time()
                             touch_state.active = True
                             touch_state.dx = 0
                             touch_state.dy = 0
@@ -6802,6 +6816,44 @@ def mode_live():
     # to its real state comes with a reason instead of looking ignored.
     notice = {"text": None, "until": 0.0}
     NOTICE_SECONDS = 5.0
+
+    # Fork: idle auto-dim. After dim_after_s with no touch the backlight drops
+    # to dim_pct of the user's level; the first touch only restores it (it is
+    # swallowed, so it can't press anything). 0 in config disables.
+    dim = _DIM
+    DIM_AFTER = float(cfg.get("dim_after_s", 30) or 0)
+    DIM_PCT = int(cfg.get("dim_pct", 20) or 20)
+
+    def _bl_read():
+        try:
+            return int(_read_sys(f"{BL_DIR}/brightness") or 0)
+        except ValueError:
+            return 0
+
+    def _bl_write(level, save=False):
+        try:
+            with open(f"{BL_DIR}/brightness", "w") as f:
+                f.write(str(int(level)))
+            if save:
+                with open(BL_SAVED, "w") as f:
+                    f.write(str(int(level)))
+        except Exception:
+            pass
+
+    def dim_screen():
+        level = _bl_read()
+        if level <= 1:
+            return
+        dim.update(on=True, restore=level, level=max(1, round(level * DIM_PCT / 100)))
+        _bl_write(dim["level"])
+
+    def undim():
+        if dim["on"]:
+            if dim["restore"]:
+                _bl_write(dim["restore"], save=True)
+            dim.update(on=False, restore=None, level=None)
+        with touch_state.lock:
+            touch_state.last_touch = time.time()
 
     def show_notice(text, seconds=NOTICE_SECONDS):
         notice["text"] = text
@@ -7574,8 +7626,36 @@ def mode_live():
         if is_screen_asleep():
             with touch_state.lock:
                 touch_state.release_pending = False
+                # fork: the idle timer restarts when the screen wakes, so a
+                # power-button wake doesn't land straight in the dimmed state
+                touch_state.last_touch = time.time()
+            dim.update(on=False, restore=None, level=None)
             time.sleep(0.1)
             continue
+
+        # Fork: idle auto-dim / wake-on-touch.
+        if dim["on"]:
+            with touch_state.lock:
+                touching = touch_state.active or touch_state.release_pending
+            if touching:
+                undim()
+                t_wait = time.time()
+                while time.time() - t_wait < 3:
+                    with touch_state.lock:
+                        if not touch_state.active:
+                            touch_state.release_pending = False
+                            break
+                    time.sleep(0.02)
+                continue
+            if _bl_read() not in (dim["level"], 0):
+                # brightness changed elsewhere (power-button wake, GL): stand down
+                dim.update(on=False, restore=None, level=None)
+        elif DIM_AFTER > 0 and view not in ("speedtest", "game"):
+            with touch_state.lock:
+                idle_for = now - touch_state.last_touch
+                touching = touch_state.active
+            if not touching and idle_for > DIM_AFTER:
+                dim_screen()
 
         if now - last_switch_req_check > 0.3:
             last_switch_req_check = now
@@ -7638,10 +7718,12 @@ def mode_live():
                             msg = "Switched to Cellular"
                         else:
                             msg = f"Switched to {wan_label(wan_dev, rep)}"
+                        undim()
                         show_notice(msg, 10.0)
                         run(["logger", "-t", "dashboard", f"WAN change {last_wan_dev} -> {wan_dev}: {msg}"])
                         last_wan_dev = wan_dev
                     if rep.get("portal") and not last_portal:
+                        undim()
                         show_notice("Hotel login needed · open any website", 12.0)
                     last_portal = bool(rep.get("portal"))
                     net_sample, net_down, net_up = sample_bandwidth(net_sample)
