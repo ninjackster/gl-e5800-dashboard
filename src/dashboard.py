@@ -3320,7 +3320,9 @@ def hit_main_travel(x, y):
     return None
 
 
-PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "openclash", "games", "travel"]
+# Fork: OpenClash and Games are left out of the carousel (code kept, unused,
+# so upstream changes still merge cleanly).
+PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "travel"]
 
 
 # ---------- main panels ----------
@@ -3368,7 +3370,7 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None):
         d.text((sx0 + 52, sy0 + 9), "Messages", font=font("default_bold", 14), fill=FG)
         d.text((sx0 + 52, sy0 + 27), "No messages", font=font("default_medium", 11), fill=DIM)
 
-    draw_page_dots(d, 0)
+    draw_page_dots(d, PANEL_NAMES.index("clock"))
     return img
 
 
@@ -3423,7 +3425,7 @@ def panel_fx(cfg, fx, fx_range, conn_type=None, cell_signal=None):
     bx0, by0, bx1, by1 = FX_BUTTON
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["fx"], width=2)
     centered_text_box(d, bx0, by0, bx1, by1, "Update Now", font("default_medium", 12), ACCENT["fx"])
-    draw_page_dots(d, 4)
+    draw_page_dots(d, PANEL_NAMES.index("fx"))
     return img
 
 
@@ -3653,7 +3655,7 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_acti
         sub = "No configs · add in LuCI"
     d.text((wx0 + 44, wy0 + 20), sub, font=font("default_medium", 10), fill=DIM)
 
-    draw_page_dots(d, 1)
+    draw_page_dots(d, PANEL_NAMES.index("sim"))
     return img
 
 
@@ -3804,7 +3806,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     _icon_speedometer(d, (x0 + x1) / 2, y0 + 17, 11, ACCENT["monitor"])
     centered_text(d, (x0 + x1) / 2, y0 + 27, "Speed test", font("default_bold", 12), FG)
 
-    draw_page_dots(d, 2)
+    draw_page_dots(d, PANEL_NAMES.index("monitor"))
     return img
 
 
@@ -4048,7 +4050,7 @@ def panel_weather(cfg, days, conn_type=None, cell_signal=None):
 
     if not days:
         centered_text(d, W / 2, 150, "no data yet", font("default_medium", 14), DIM)
-        draw_page_dots(d, 3)
+        draw_page_dots(d, PANEL_NAMES.index("weather"))
         return img
 
     day_labels = weather_day_labels(days)
@@ -4072,7 +4074,7 @@ def panel_weather(cfg, days, conn_type=None, cell_signal=None):
     d.rounded_rectangle([bx0, by0, bx1, by1], radius=(by1 - by0) / 2, outline=ACCENT["weather"], width=2)
     centered_text_box(d, bx0, by0, bx1, by1, "Update Now", font("default_medium", 12), ACCENT["weather"])
 
-    draw_page_dots(d, 3)
+    draw_page_dots(d, PANEL_NAMES.index("weather"))
     return img
 
 
@@ -5641,7 +5643,6 @@ def mode_preview(outdir):
         ("speedtest_done", panel_speedtest({"phase": "done", "live": 0.0, "progress": 1.0, "down": 212.6,
                                             "up": 41.3, "bytes": 205e6, "error": None, "via": conn_type})),
         ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
-        ("openclash", panel_openclash(oc, traf, conn_type, cell_signal)),
         ("travel", panel_travel(get_travel_status(), conn_type, cell_signal)),
         ("travel_ranch_demo", panel_travel(dict(travel_status_empty(True), speedify="CONNECTED", ranch=True, tunnel=True, handshake_s=12), conn_type, cell_signal)),
         ("travel_down_demo", panel_travel(dict(travel_status_empty(True), speedify="DISCONNECTED", ranch=True, tunnel=False), conn_type, cell_signal)),
@@ -5653,7 +5654,6 @@ def mode_preview(outdir):
         ("fx_bottom_from", panel_currency_picker("bottom", "from", cfg)),
         ("fx_bottom_to", panel_currency_picker("bottom", "to", cfg)),
         ("datacap", panel_datacap_picker(cfg)),
-        ("oc_nodes", panel_node_picker(traf)),
         ("weather_city", panel_weather_picker(cfg)),
         ("weather_detail", panel_weather_detail(cfg, wx[0], aq[0] if aq else None, weather_day_labels(wx)[0]) if wx else new_canvas()[0]),
         ("sms", panel_sms(sms_messages or _DEMO_SMS_MESSAGES)),
@@ -5664,11 +5664,6 @@ def mode_preview(outdir):
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
         ("confirm_long", panel_confirm("Stock UI", "Hand the screen back to the GL.iNet UI?", ACCENT["clock"], yes_label="Switch")),
         ("keyboard", panel_keyboard("Wi-Fi Password", "myPass", "letters", True, ACCENT["clock"])),
-        ("games_hub", panel_games(load_game_scores())),
-        ("game_snake", draw_snake(new_snake_state(), load_game_scores())),
-        ("game_flappy", draw_flappy(new_flappy_state(), load_game_scores())),
-        ("game_breakout", draw_breakout(new_breakout_state(), load_game_scores())),
-        ("game_2048", draw_2048(new_2048_state(), load_game_scores())),
     ]
     cols, pad = 5, 10
     rows = (len(screens) + cols - 1) // cols
@@ -5905,8 +5900,6 @@ def mode_live():
     refresher.add("sim", lambda: get_sim_status(cfg), 30)
     # 10s: the toggle now shows whether the core is actually running, and
     # OpenClash also gets started/stopped from LuCI or the GL app.
-    refresher.add("oc", get_openclash_status, 10)
-    refresher.add("traf", get_openclash_traffic_and_node, 20)
     # 5s: Speedify and the ranch tunnel also change from the GL UI and LuCI.
     refresher.add("travel", get_travel_status, 5)
     refresher.add("wx", lambda: fetch_weather(cfg["weather_city"]), 1800)
