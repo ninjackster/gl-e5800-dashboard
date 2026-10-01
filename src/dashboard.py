@@ -69,11 +69,12 @@ MCC_COUNTRY = {
 CITIES = [
     ("Pacific/Auckland", "Auckland"),
     ("Europe/Berlin", "Berlin"),
+    ("America/Los_Angeles", "California"),
     ("America/Chicago", "Chicago"),
     ("Asia/Dubai", "Dubai"),
+    ("America/Mexico_City", "Guadalajara"),
     ("Asia/Hong_Kong", "Hong Kong"),
     ("Europe/London", "London"),
-    ("America/Los_Angeles", "Los Angeles"),
     ("Europe/Moscow", "Moscow"),
     ("America/New_York", "New York"),
     ("Europe/Paris", "Paris"),
@@ -148,8 +149,8 @@ WEATHER_CITIES = [
 ]
 
 DEFAULT_CONFIG = {
-    "clock_top": "Europe/London",
-    "clock_bottom": "Asia/Shanghai",
+    "clock_top": "America/Los_Angeles",
+    "clock_bottom": "America/Mexico_City",
     "fx_top_from": "USD",
     "fx_top_to": "CNY",
     "fx_bottom_from": "GBP",
@@ -3320,9 +3321,9 @@ def hit_main_travel(x, y):
     return None
 
 
-# Fork: OpenClash and Games are left out of the carousel (code kept, unused,
+# Fork: OpenClash, Games, Weather and Currency are left out of the carousel (code kept, unused,
 # so upstream changes still merge cleanly).
-PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "travel"]
+PANEL_NAMES = ["clock", "sim", "monitor", "travel"]
 
 
 # ---------- main panels ----------
@@ -5635,27 +5636,19 @@ def mode_preview(outdir):
         ("sim", panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info)),
         ("sim_confirm", panel_confirm("Mobile data", "Turn mobile data off? SMS and calls still work. Internet runs over cellular right now, so the router will go offline.", ACCENT["sim"], yes_label="Turn off", danger=True)),
         ("sim_verifying", draw_loading_overlay(panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, _cell_info), "Registering… 7s", 120, ACCENT["sim"])),
-        ("weather", panel_weather(cfg, wx, conn_type, cell_signal)),
         ("monitor", panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ram_total_gb, temp_c, sysinfo["uptime_min"], conn_type, cell_signal)),
         ("speedtest", panel_speedtest(SpeedTest().snapshot())),
         ("speedtest_running", panel_speedtest({"phase": "upload", "live": 38.4, "progress": 0.45, "down": 212.6,
                                                "up": None, "bytes": 171e6, "error": None, "via": conn_type}, 90)),
         ("speedtest_done", panel_speedtest({"phase": "done", "live": 0.0, "progress": 1.0, "down": 212.6,
                                             "up": 41.3, "bytes": 205e6, "error": None, "via": conn_type})),
-        ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
         ("travel", panel_travel(get_travel_status(), conn_type, cell_signal)),
         ("travel_ranch_demo", panel_travel(dict(travel_status_empty(True), speedify="CONNECTED", ranch=True, tunnel=True, handshake_s=12), conn_type, cell_signal)),
         ("travel_down_demo", panel_travel(dict(travel_status_empty(True), speedify="DISCONNECTED", ranch=True, tunnel=False), conn_type, cell_signal)),
         ("travel_confirm", panel_confirm("Ranch exit", "Send all devices out the ranch home IP? If the ranch is offline they lose internet until you turn this off.", ACCENT["travel"], yes_label="Turn on")),
         ("city_top", panel_city_picker("top", cfg)),
         ("city_bottom", panel_city_picker("bottom", cfg)),
-        ("fx_top_from", panel_currency_picker("top", "from", cfg)),
-        ("fx_top_to", panel_currency_picker("top", "to", cfg)),
-        ("fx_bottom_from", panel_currency_picker("bottom", "from", cfg)),
-        ("fx_bottom_to", panel_currency_picker("bottom", "to", cfg)),
         ("datacap", panel_datacap_picker(cfg)),
-        ("weather_city", panel_weather_picker(cfg)),
-        ("weather_detail", panel_weather_detail(cfg, wx[0], aq[0] if aq else None, weather_day_labels(wx)[0]) if wx else new_canvas()[0]),
         ("sms", panel_sms(sms_messages or _DEMO_SMS_MESSAGES)),
         ("sms_detail", panel_sms_detail((sms_messages or _DEMO_SMS_MESSAGES)[0])),
         ("wireguard", panel_wireguard(wg_peers, wg_active)),
@@ -5896,14 +5889,11 @@ def mode_live():
     # already-fetched values, so a slow curl or a wedged ubus call can no
     # longer stall drawing or touch handling.
     refresher = Refresher()
-    refresher.add("fx", fetch_fx, 300)
     refresher.add("sim", lambda: get_sim_status(cfg), 30)
     # 10s: the toggle now shows whether the core is actually running, and
     # OpenClash also gets started/stopped from LuCI or the GL app.
     # 5s: Speedify and the ranch tunnel also change from the GL UI and LuCI.
     refresher.add("travel", get_travel_status, 5)
-    refresher.add("wx", lambda: fetch_weather(cfg["weather_city"]), 1800)
-    refresher.add("aq", lambda: fetch_air_quality(cfg["weather_city"]), 1800)
     refresher.add("sms", get_sms_messages, 15)
     refresher.add("rep", get_repeater_status, 30)
     refresher.add("wg_peers", get_wireguard_peers, 120)
@@ -5927,7 +5917,7 @@ def mode_live():
 
     # Seeded from cache/defaults so the first frame draws immediately
     # instead of waiting on the first refresher pass.
-    fx = fetch_fx()
+    fx = {}  # Currency page is out of this fork's carousel; skip the startup fetch
     sim = {"slot": "1", "country": None, "phone": "", "traffic_mb": None,
            "cap_mb": cfg.get("data_cap_mb"), "sim_choice": "sim1", "data_up": False,
            "iccid": None, "attached": False, "roaming": False, "carrier": None, "airplane": False}
