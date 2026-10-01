@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H = 240, 320
 FB_PATH = "/dev/fb0"
@@ -112,6 +112,57 @@ HEADER_STYLE = _T["header"]
 ACCENT = _T["accent"]
 ACCENT2 = _T["accent2"]
 HEADER_INK = (14, 14, 22)
+
+# Wallpaper (fork): "wallpaper" in config.json (or DASH_WALLPAPER) names an
+# image file; it is cover-cropped to the screen, softened and darkened toward
+# BG so text stays readable. Headers and cards then become frosted glass over
+# it instead of solid fills. No wallpaper keeps the flat background.
+WALL_DIM = 0.58      # how far the photo is pulled toward BG
+WALL_BLUR = 1.2
+GLASS_DIM = 0.70     # how dark a glass panel is over the photo
+
+
+def _load_wallpaper():
+    path = os.environ.get("DASH_WALLPAPER")
+    if not path:
+        try:
+            path = json.loads(CONFIG_FILE.read_text()).get("wallpaper")
+        except Exception:
+            path = None
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        im = Image.open(path).convert("RGB")
+        scale = max(W / im.width, H / im.height)
+        im = im.resize((max(W, round(im.width * scale)), max(H, round(im.height * scale))), Image.LANCZOS)
+        left, top = (im.width - W) // 2, (im.height - H) // 2
+        im = im.crop((left, top, left + W, top + H))
+        if WALL_BLUR:
+            im = im.filter(ImageFilter.GaussianBlur(WALL_BLUR))
+        return Image.blend(im, Image.new("RGB", (W, H), BG), WALL_DIM)
+    except Exception:
+        return None
+
+
+WALLPAPER = _load_wallpaper()
+
+
+def glass(d, box, radius=0, fill=None, outline=None, width=1, dim=GLASS_DIM):
+    """A panel that is frosted glass over the wallpaper, or a plain fill
+    when there is no wallpaper (identical to the upstream drawing)."""
+    fill = SURFACE if fill is None else fill
+    im = getattr(d, "_image", None)
+    if WALLPAPER is None or im is None:
+        d.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+        return
+    x0, y0, x1, y1 = [int(round(v)) for v in box]
+    region = im.crop((x0, y0, x1 + 1, y1 + 1))
+    tinted = Image.blend(region, Image.new("RGB", region.size, fill), dim)
+    mask = Image.new("L", region.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, x1 - x0, y1 - y0], radius=radius, fill=255)
+    im.paste(tinted, (x0, y0), mask)
+    if outline:
+        d.rounded_rectangle(box, radius=radius, outline=outline, width=width)
 
 MCC_COUNTRY = {
     "234": "UK", "235": "UK",
@@ -2880,7 +2931,7 @@ def run_with_spinner(base_img, label, fn, accent=None, min_visible=0.4, fps=30):
 # ---------- widgets ----------
 
 def new_canvas():
-    img = Image.new("RGB", (W, H), BG)
+    img = WALLPAPER.copy() if WALLPAPER is not None else Image.new("RGB", (W, H), BG)
     return img, ImageDraw.Draw(img)
 
 
@@ -2998,7 +3049,7 @@ def _header_bar(d, accent, h):
             d.line([x, 0, x, h], fill=_mix(accent, a2, x / (W - 1)))
         return HEADER_INK, a2
     if HEADER_STYLE == "dark":
-        d.rectangle([0, 0, W, h], fill=SURFACE)
+        glass(d, [0, 0, W, h], fill=SURFACE, dim=0.80)
         d.rectangle([0, h - 2, W, h], fill=accent)
         return FG, SURFACE
     d.rectangle([0, 0, W, h], fill=accent)
@@ -3178,7 +3229,7 @@ def wrap_text_to_lines(d, text, f, max_w):
 
 
 def draw_tile(d, x0, y0, x1, y1, icon_fn, label, subtitle, accent):
-    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
+    glass(d, [x0, y0, x1, y1], radius=10, outline=SURFACE_EDGE)
     cx = (x0 + x1) / 2
     icon_fn(d, cx, y0 + 32, 20, accent)
     centered_text(d, cx, y0 + 58, label, font("default_bold", 14), FG)
@@ -3441,7 +3492,7 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None):
               "More", "Settings", ACCENT["clock"])
 
     sx0, sy0, sx1, sy1 = SMS_TILE
-    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
+    glass(d, [sx0, sy0, sx1, sy1], radius=10, outline=SURFACE_EDGE)
     _icon_sms(d, sx0 + 28, (sy0 + sy1) / 2, 13, ACCENT["clock"])
     messages = sms_messages or []
     if messages:
@@ -3551,7 +3602,7 @@ def _draw_signal_card(d, cell, carrier, airplane=False):
     bars + primary-carrier RSRP, and the serving carrier's name -- or,
     with cellular switched off, an unmissable airplane-mode state."""
     x0, y0, x1, y1 = SIM_SIGNAL_CARD
-    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
+    glass(d, [x0, y0, x1, y1], radius=10, outline=SURFACE_EDGE)
     ix0, ix1 = x0 + 7, x1 - 7
     if airplane:
         _icon_airplane(d, (x0 + x1) / 2, y0 + 22, 13, AIRPLANE_COLOR)
@@ -3727,7 +3778,7 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_acti
     centered_text(d, W / 2, 228, caption, font("default_medium", 11), DIM)
 
     wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
-    d.rounded_rectangle([wx0, wy0, wx1, wy1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
+    glass(d, [wx0, wy0, wx1, wy1], radius=10, outline=SURFACE_EDGE)
     _icon_shield(d, wx0 + 24, (wy0 + wy1) / 2, 11, ACCENT["sim"])
     peers = wg_peers or []
     active = next((p["name"] for p in peers if p["id"] == wg_active), None)
@@ -3887,7 +3938,7 @@ def panel_monitor(net_down, net_up, net_iface, cpu_pct, ram_pct, ram_used_gb, ra
     d.text((76, 264), up_txt, font=f_row, fill=FG)
 
     x0, y0, x1, y1 = MONITOR_SPEEDTEST_BTN
-    d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=SURFACE, outline=SURFACE_EDGE, width=1)
+    glass(d, [x0, y0, x1, y1], radius=10, outline=SURFACE_EDGE)
     _icon_speedometer(d, (x0 + x1) / 2, y0 + 17, 11, ACCENT["monitor"])
     centered_text(d, (x0 + x1) / 2, y0 + 27, "Speed test", font("default_bold", 12), FG)
 
