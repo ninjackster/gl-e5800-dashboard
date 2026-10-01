@@ -3189,11 +3189,9 @@ PICKER_TOP, PICKER_BOTTOM = 38, 316
 
 SPEEDIFY_CLI = "/usr/share/speedify/speedify_cli"
 HOMEIP = "/usr/bin/homeip"
-TRAVEL_CELL_ADAPTERS = ("rmnet_data0", "rmnet_data1")
 TRAVEL_CONNECT_TIMEOUT = 60
 TRAVEL_SPEEDIFY_TOGGLE = (172, 38, 218, 60)
 TRAVEL_RANCH_TOGGLE = (172, 92, 218, 114)
-TRAVEL_CELL_TOGGLE = (172, 160, 218, 182)
 
 
 def travel_installed():
@@ -3202,7 +3200,7 @@ def travel_installed():
 
 def travel_status_empty(installed=False):
     return {"installed": installed, "speedify": None, "ranch": False,
-            "tunnel": None, "handshake_s": None, "cell": None}
+            "tunnel": None, "handshake_s": None}
 
 
 def _speedify_json(*args, timeout=10):
@@ -3218,24 +3216,11 @@ def get_speedify_state():
     return j.get("state") if isinstance(j, dict) else None
 
 
-def get_speedify_cell_priority():
-    """'always' / 'automatic' / ... for the first cellular adapter Speedify
-    knows about, or None when it can't be read."""
-    j = _speedify_json("show", "adapters")
-    if not isinstance(j, list):
-        return None
-    for a in j:
-        if isinstance(a, dict) and a.get("name") in TRAVEL_CELL_ADAPTERS and a.get("priority"):
-            return a["priority"]
-    return None
-
-
 def get_travel_status():
     st = travel_status_empty(travel_installed())
     if not st["installed"]:
         return st
     st["speedify"] = get_speedify_state()
-    st["cell"] = get_speedify_cell_priority()
     out = run([HOMEIP, "status"], timeout=10)
     st["ranch"] = "exit: RANCH" in out
     if st["ranch"]:
@@ -3262,13 +3247,6 @@ def set_ranch_exit(want):
     # handshake itself; its exit code is all we need.
     ok, _ = run_checked([HOMEIP, "on" if want else "off"], timeout=60)
     return ok
-
-
-def set_speedify_cell_priority(always):
-    want = "always" if always else "automatic"
-    for a in TRAVEL_CELL_ADAPTERS:
-        run([SPEEDIFY_CLI, "adapter", "priority", a, want], timeout=10)
-    return get_speedify_cell_priority() == want
 
 
 def travel_exit_summary(st):
@@ -3323,34 +3301,19 @@ def panel_travel(st, conn_type=None, cell_signal=None):
 
     d.line([16, 148, W - 16, 148], fill=(40, 44, 54))
 
-    d.text((16, 161), "Cellular in Speedify", font=f_lbl, fill=FG)
-    cell = st["cell"]
-    if cell == "always":
-        c_txt, c_col = "Always · full bonding", accent
-    elif cell:
-        c_txt, c_col = f"{cell.capitalize()} · light use", DIM
-    else:
-        c_txt, c_col = "Unknown", DIM
-    d.text((16, 180), c_txt, font=f_sub, fill=c_col)
-    tx0, ty0, tx1, ty1 = TRAVEL_CELL_TOGGLE
-    draw_toggle(d, tx0, ty0, cell == "always", accent, w=tx1 - tx0, h=ty1 - ty0)
-
-    d.line([16, 200, W - 16, 200], fill=(40, 44, 54))
-
     summary, s_col = travel_exit_summary(st)
-    centered_text(d, W / 2, 214, summary, font("default_medium", 14), s_col)
+    centered_text(d, W / 2, 166, summary, font("default_medium", 14), s_col)
     hint = ("Ranch offline? Turn Ranch exit off." if st["ranch"]
             else "Ranch exit works with or without Speedify.")
     for i, line in enumerate(wrap_text_to_lines(d, hint, font("default_medium", 11), W - 40)):
-        centered_text(d, W / 2, 242 + i * 15, line, font("default_medium", 11), DIM)
+        centered_text(d, W / 2, 194 + i * 15, line, font("default_medium", 11), DIM)
     draw_page_dots(d, idx)
     return img
 
 
 def hit_main_travel(x, y):
     for zone, rect in (("speedify", TRAVEL_SPEEDIFY_TOGGLE),
-                       ("ranch", TRAVEL_RANCH_TOGGLE),
-                       ("cell", TRAVEL_CELL_TOGGLE)):
+                       ("ranch", TRAVEL_RANCH_TOGGLE)):
         tx0, ty0, tx1, ty1 = rect
         if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
             return zone
@@ -5680,8 +5643,8 @@ def mode_preview(outdir):
         ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
         ("openclash", panel_openclash(oc, traf, conn_type, cell_signal)),
         ("travel", panel_travel(get_travel_status(), conn_type, cell_signal)),
-        ("travel_ranch_demo", panel_travel(dict(travel_status_empty(True), speedify="CONNECTED", ranch=True, tunnel=True, handshake_s=12, cell="always"), conn_type, cell_signal)),
-        ("travel_down_demo", panel_travel(dict(travel_status_empty(True), speedify="DISCONNECTED", ranch=True, tunnel=False, cell="automatic"), conn_type, cell_signal)),
+        ("travel_ranch_demo", panel_travel(dict(travel_status_empty(True), speedify="CONNECTED", ranch=True, tunnel=True, handshake_s=12), conn_type, cell_signal)),
+        ("travel_down_demo", panel_travel(dict(travel_status_empty(True), speedify="DISCONNECTED", ranch=True, tunnel=False), conn_type, cell_signal)),
         ("travel_confirm", panel_confirm("Ranch exit", "Send all devices out the ranch home IP? If the ranch is offline they lose internet until you turn this off.", ACCENT["travel"], yes_label="Turn on")),
         ("city_top", panel_city_picker("top", cfg)),
         ("city_bottom", panel_city_picker("bottom", cfg)),
@@ -6522,16 +6485,6 @@ def mode_live():
                 confirm_message = "Stop using the ranch home IP? Devices go back to the normal exit."
                 confirm_yes_label = "Turn off"
             confirm_action = f"tr_ranch:{'on' if want else 'off'}"
-        else:
-            want = travel["cell"] != "always"
-            confirm_title = "Cellular"
-            if want:
-                confirm_message = "Let Speedify use cellular fully? Faster bonding, but it uses mobile data."
-                confirm_yes_label = "Always"
-            else:
-                confirm_message = "Back to automatic? Speedify will use cellular lightly."
-                confirm_yes_label = "Automatic"
-            confirm_action = f"tr_cell:{'on' if want else 'off'}"
         confirm_return_view = "main"
         return None
 
@@ -6545,10 +6498,8 @@ def mode_live():
         want = val == "on"
         if kind == "tr_speedify":
             label, fn = ("Connecting Speedify…" if want else "Disconnecting…"), lambda: set_speedify_connected(want)
-        elif kind == "tr_ranch":
-            label, fn = ("Starting ranch tunnel…" if want else "Restoring normal exit…"), lambda: set_ranch_exit(want)
         else:
-            label, fn = "Updating Speedify…", lambda: set_speedify_cell_priority(want)
+            label, fn = ("Starting ranch tunnel…" if want else "Restoring normal exit…"), lambda: set_ranch_exit(want)
 
         def work():
             return fn(), get_travel_status()
@@ -6563,9 +6514,7 @@ def mode_live():
             return None
         if kind == "tr_speedify":
             return f"Speedify didn't {'connect' if want else 'disconnect'} within {TRAVEL_CONNECT_TIMEOUT}s"
-        if kind == "tr_ranch":
-            return "homeip reported an error -- check the router log"
-        return "Speedify didn't take the cellular setting"
+        return "homeip reported an error -- check the router log"
 
     def run_openclash_action(action):
         """Runs a confirmed OpenClash action under a spinner over the
