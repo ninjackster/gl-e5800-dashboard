@@ -4347,12 +4347,7 @@ def panel_more(wifi24, wifi_band, clock_style, wifi56_disabled_idx=None):
 
     d.line([16, 150, W - 16, 150], fill=LINE)
 
-    d.text((16, 160), "Clock Style", font=font("default_medium", 15), fill=FG)
-    sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
-    sel_idx = 0 if clock_style == "analog" else 1
-    draw_segmented(d, sx0, sy0, sx1 - sx0, sy1 - sy0, ["Analog", "Digital"], sel_idx, ACCENT["clock"])
-
-    d.line([16, 222, W - 16, 222], fill=LINE)
+    # Fork: Clock Style row removed (digital clocks are fixed via config).
 
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=ACCENT["clock"], width=2)
@@ -4380,9 +4375,6 @@ def hit_more(x, y, wifi56_disabled_idx=None):
         if idx == wifi56_disabled_idx:
             return None
         return ["wifi_5g", "wifi_off", "wifi_6g"][idx]
-    sx0, sy0, sx1, sy1 = MORE_CLOCK_STYLE_SEG
-    if sx0 <= x <= sx1 and sy0 <= y <= sy1:
-        return "clock_analog" if x < (sx0 + sx1) / 2 else "clock_digital"
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     if rx0 <= x <= rx1 and ry0 <= y <= ry1:
         return "return_stock"
