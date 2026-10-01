@@ -3621,8 +3621,16 @@ def set_wan_iface_up(iface, up):
 
 
 def reconnect_cellular():
-    """Redial the cellular data session and wait for it to come back."""
-    run(["ifup", "modem_cpu"], timeout=20)
+    """Redial the cellular data session and wait for it to come back.
+    Uses GL's dial manager with source 0 (USER MANUAL, the same as the web
+    UI's Connect). ifup alone only rebuilds the interface; it cannot recover
+    the manager when it is stuck in WAIT_SCRIPT with no data bearer, which
+    was seen live on 2026-10-01 (cellular down ~1 h, cleared in 8 s)."""
+    try:
+        slot = int(ubus_call("cellular.modem", "status", {"bus": "cpu"}).get("current_sim_slot", 1))
+    except (TypeError, ValueError):
+        slot = 1
+    ubus_call("cellular.cm", "cm_start_dial", {"bus": "cpu", "slot": slot, "source": 0})
     deadline = time.time() + 60
     time.sleep(3)
     while time.time() < deadline:
