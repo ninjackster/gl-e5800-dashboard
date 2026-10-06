@@ -3472,7 +3472,7 @@ def _icon_sun_small(d, cx, cy, r, color):
                 cx + math.cos(a) * r, cy + math.sin(a) * r], fill=color, width=2)
 
 
-def panel_shade(pct, dim_after=30):
+def panel_shade(pct, dim_after=30, idle_action="off"):
     img, d = new_canvas()
     accent = ACCENT["clock"]
     glass(d, [0, 0, W, H], radius=0, dim=0.55)
@@ -3491,7 +3491,8 @@ def panel_shade(pct, dim_after=30):
         d.rounded_rectangle([x0, cy - 4, kx, cy + 4], radius=4, fill=accent)
         d.ellipse([kx - 10, cy - 10, kx + 10, cy + 10], fill=(255, 255, 255))
     d.line([16, 118, W - 16, 118], fill=LINE)
-    d.text((16, 128), "Auto-dim", font=font("default_medium", 14), fill=FG)
+    d.text((16, 128), "Screen off after" if idle_action == "off" else "Auto-dim",
+           font=font("default_medium", 14), fill=FG)
     sx0, sy0, sx1, sy1 = SHADE_DIM_SEG
     vals = [v for v, _ in SHADE_DIM_CHOICES]
     sel = vals.index(dim_after) if dim_after in vals else -1
@@ -6504,7 +6505,8 @@ def mode_preview(outdir):
         ("net_tethering", panel_tethering(get_networks_state(), get_otg_state())),
         ("net_tethering_receive", panel_tethering(get_networks_state(), dict(get_otg_state(), role="host"))),
         ("cellular", panel_cellular((get_cellular_detail(), time.sleep(0.2), get_cellular_detail())[2])),
-        ("shade", panel_shade(get_brightness_pct(), int(cfg.get("dim_after_s", 30) or 0))),
+        ("shade", panel_shade(get_brightness_pct(), int(cfg.get("dim_after_s", 30) or 0),
+                              cfg.get("idle_action", "off"))),
         ("devices", panel_devices(get_devices() or [
             {"name": "Mac", "ip": "192.168.2.165", "iface": "5G", "down": 1800000, "up": 90000},
             {"name": "iPhone", "ip": "192.168.2.120", "iface": "5G", "down": 42000, "up": 9000}])),
@@ -6830,15 +6832,20 @@ def mode_live():
     notice = {"text": None, "until": 0.0}
     NOTICE_SECONDS = 5.0
 
-    # Fork: idle auto-dim. After dim_after_s with no touch the backlight drops
-    # to dim_pct of the user's level; the first touch only restores it (it is
-    # swallowed, so it can't press anything). 0 in config disables.
+    # Fork: idle timeout. After dim_after_s with no touch, idle_action "off"
+    # (default) puts the panel to real hardware sleep via screen_sleep.sh, the
+    # same as the shade's Screen off: backlight and LCD off, render loop idle,
+    # power button wakes. idle_action "dim" instead drops the backlight to
+    # dim_pct of the user's level and the first touch restores it (that touch
+    # is swallowed, so it can't press anything). 0 in config disables both.
     dim = _DIM
     def dim_after():
         try:
             return float(cfg.get("dim_after_s", 30) or 0)
         except (TypeError, ValueError):
             return 30.0
+    def idle_action():
+        return "dim" if cfg.get("idle_action") == "dim" else "off"
     DIM_PCT = int(cfg.get("dim_pct", 20) or 20)
 
     def _bl_read():
@@ -6863,6 +6870,12 @@ def mode_live():
             return
         dim.update(on=True, restore=level, level=max(1, round(level * DIM_PCT / 100)))
         _bl_write(dim["level"])
+
+    def sleep_screen():
+        run(["/root/dashboard/screen_sleep.sh", "off"], timeout=5)
+        _asleep_cache["ts"] = 0.0   # let the asleep branch see it next pass
+        with touch_state.lock:      # if the sleep didn't take, retry after
+            touch_state.last_touch = time.time()   # another full timeout
 
     def undim():
         if dim["on"]:
@@ -7228,7 +7241,7 @@ def mode_live():
             if want != shade_pct:
                 got = set_brightness_pct(want)
                 shade_pct = got if got is not None else shade_pct
-                write_frame(panel_shade(shade_pct, int(dim_after())))
+                write_frame(panel_shade(shade_pct, int(dim_after()), idle_action()))
         elif released:
             is_tap = (have_pos and abs(release_dx) <= TAP_JITTER_PX
                       and abs(release_dy) <= TAP_JITTER_PX)
@@ -7242,15 +7255,15 @@ def mode_live():
                 save_config(cfg)
                 with touch_state.lock:
                     touch_state.last_touch = time.time()
-                write_frame(panel_shade(shade_pct, int(dim_after())))
+                write_frame(panel_shade(shade_pct, int(dim_after()), idle_action()))
             elif is_tap and zone == "screen_off":
                 close()
                 run(["/root/dashboard/screen_sleep.sh", "off"], timeout=5)
             elif zone == "slider":
-                write_frame(panel_shade(shade_pct, int(dim_after())))
+                write_frame(panel_shade(shade_pct, int(dim_after()), idle_action()))
         elif sub_dirty:
             shade_pct = get_brightness_pct()
-            write_frame(panel_shade(shade_pct, int(dim_after())))
+            write_frame(panel_shade(shade_pct, int(dim_after()), idle_action()))
             sub_dirty = False
 
     def handle_sms_scroll(now):
@@ -7678,7 +7691,10 @@ def mode_live():
                 idle_for = now - touch_state.last_touch
                 touching = touch_state.active
             if not touching and idle_for > dim_after():
-                dim_screen()
+                if idle_action() == "off":
+                    sleep_screen()
+                else:
+                    dim_screen()
 
         if now - last_switch_req_check > 0.3:
             last_switch_req_check = now
