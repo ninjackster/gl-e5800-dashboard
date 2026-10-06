@@ -18,6 +18,15 @@ term_handler() {
 }
 trap term_handler TERM INT
 
+# Stop GL's boot animation. gl_screen normally does this once it has
+# initialised (platform.sh kill_boot); with gl_screen replaced nothing
+# did, so screen_boot kept spinning for the whole uptime -- measured at
+# ~12% of one core (232 ticks/20s), 11x the dashboard's own idle cost.
+if [ -x /etc/gl_screen/platform.sh ] && pidof screen_boot >/dev/null; then
+    /etc/gl_screen/platform.sh kill_boot >/dev/null 2>&1
+    logger -t "$LOG_TAG" "stopped boot animation (screen_boot)"
+fi
+
 fails=0
 # A run that lasted this long counts as healthy: the crash counter is
 # about "this build cannot start", not "this build has ever crashed".
