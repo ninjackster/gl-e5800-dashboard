@@ -484,7 +484,15 @@ class Refresher:
     were the ones left behind.
 
     Jobs are plain callables run in registration order; a job that raises
-    keeps its previous value rather than taking the thread down."""
+    keeps its previous value rather than taking the thread down.
+
+    Fork: while the screen is asleep nobody can see these values, so each
+    job's interval is stretched by its asleep_factor (default ASLEEP_FACTOR)
+    to save battery. refresh_all() on wake brings everything current at
+    once, so the first lit frame isn't stale. A job that feeds a wake alert
+    (the hotel-portal check) passes asleep_factor=1 to keep its pace."""
+
+    ASLEEP_FACTOR = 4
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -496,10 +504,11 @@ class Refresher:
         # pass when nothing has changed -- most jobs run every 5-30s.
         self.version = 0
 
-    def add(self, name, fn, interval, initial=None, run_now=True):
+    def add(self, name, fn, interval, initial=None, run_now=True, asleep_factor=None):
         with self.lock:
             self._values[name] = initial
-        self._jobs.append([name, fn, interval, 0.0 if run_now else time.time() + interval])
+        factor = self.ASLEEP_FACTOR if asleep_factor is None else asleep_factor
+        self._jobs.append([name, fn, interval, 0.0 if run_now else time.time() + interval, factor])
 
     def get(self, name, default=None):
         with self.lock:
@@ -513,6 +522,12 @@ class Refresher:
         with self.lock:
             self._values[name] = value
             self.version += 1
+
+    def refresh_all(self):
+        """Run every job as soon as the worker next wakes (screen wake)."""
+        for job in self._jobs:
+            job[3] = 0.0
+        self._wake.set()
 
     def request(self, name):
         """Ask for one job to run as soon as the worker next wakes."""
@@ -528,14 +543,15 @@ class Refresher:
         while not _stop:
             now = time.time()
             sleep_for = 5.0
+            asleep = is_screen_asleep()
             for job in self._jobs:
-                name, fn, interval, next_at = job
+                name, fn, interval, next_at, factor = job
                 if now >= next_at:
                     try:
                         value = fn()
                     except Exception:
                         value = None
-                    job[3] = time.time() + interval
+                    job[3] = time.time() + interval * (factor if asleep else 1)
                     if value is not None:
                         with self.lock:
                             self._values[name] = value
@@ -2763,9 +2779,30 @@ def draw_analog_clock(d, cx, cy, r, dt, accent):
     d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=accent)
 
 
-def draw_digital_clock(d, cx, cy, dt, accent, show_seconds=True, size=30):
-    f_time = font("default_mono_medium", size)
-    centered_text(d, cx, cy - 20, dt.strftime("%H:%M"), f_time, FG)
+def draw_digital_clock(d, cx, cy, dt, accent, show_seconds=True, size=30, h12=True, max_w=None):
+    """Fork: 12-hour by default ("9:05" with a small AM/PM after the
+    digits, the group centered on cx). max_w shrinks the digits until the
+    group fits, since the Home clocks share a 120 px column each."""
+    if not h12:
+        centered_text(d, cx, cy - 20, dt.strftime("%H:%M"), font("default_mono_medium", size), FG)
+    else:
+        txt = f"{dt.hour % 12 or 12}:{dt.minute:02d}"
+        ampm = "AM" if dt.hour < 12 else "PM"
+        f_ap = font("default_bold", 11)
+        gap = 3
+        while True:
+            f_time = font("default_mono_medium", size)
+            tw = d.textlength(txt, font=f_time)
+            aw = d.textlength(ampm, font=f_ap)
+            if not max_w or tw + gap + aw <= max_w or size <= 18:
+                break
+            size -= 2
+        x0 = cx - (tw + gap + aw) / 2
+        top = cy - 20 + (34 - size) * 0.6   # same origin as centered_text; re-center if shrunk
+        tb = d.textbbox((0, 0), txt, font=f_time)
+        d.text((x0, top), txt, font=f_time, fill=FG)
+        ab = d.textbbox((0, 0), ampm, font=f_ap)
+        d.text((x0 + tw + gap, top + tb[3] - ab[3]), ampm, font=f_ap, fill=accent)
     if show_seconds:
         f_sec = font("default_medium", 13)
         centered_text(d, cx, cy + 14, dt.strftime(":%S"), f_sec, accent)
@@ -4184,8 +4221,10 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None, t
     dt_r = datetime.now(ZoneInfo(tz_r))
 
     if cfg.get("clock_style") == "digital":
-        draw_digital_clock(d, W / 4, 64, dt_l, ACCENT["clock"], show_seconds=False, size=34)
-        draw_digital_clock(d, W * 3 / 4, 64, dt_r, ACCENT["clock"], show_seconds=False, size=34)
+        draw_digital_clock(d, W / 4, 64, dt_l, ACCENT["clock"], show_seconds=False, size=34,
+                           h12=cfg.get("clock_24h") is not True, max_w=W / 2 - 8)
+        draw_digital_clock(d, W * 3 / 4, 64, dt_r, ACCENT["clock"], show_seconds=False, size=34,
+                           h12=cfg.get("clock_24h") is not True, max_w=W / 2 - 8)
     else:
         draw_analog_clock(d, W / 4, 72, 30, dt_l, ACCENT["clock"])
         draw_analog_clock(d, W * 3 / 4, 72, 30, dt_r, ACCENT["clock"])
@@ -5224,7 +5263,7 @@ def panel_sms(messages, scroll_px=0):
         if y0 + SMS_ROW_H < 0 or y0 > list_h:
             continue
         ld.text((16, y0 + 6), msg["from"], font=f_sender, fill=FG)
-        when = msg["sent"].strftime("%d %b %H:%M") if msg["sent"] else ""
+        when = msg["sent"].strftime("%d %b %-I:%M %p") if msg["sent"] else ""
         wbbox = ld.textbbox((0, 0), when, font=f_time)
         ld.text((W - 16 - (wbbox[2] - wbbox[0]), y0 + 9), when, font=f_time, fill=DIM)
         preview = truncate_to_width(ld, msg["body"].replace("\n", " "), f_body, W - 32)
@@ -5256,7 +5295,7 @@ def hit_sms(y, n_messages, scroll_px=0):
 def panel_sms_detail(msg):
     img, d = new_canvas()
     draw_back_header(d, msg["from"], ACCENT["clock"])
-    when = msg["sent"].strftime("%a %d %b %Y, %H:%M") if msg["sent"] else msg.get("sent_raw", "")
+    when = msg["sent"].strftime("%a %d %b %Y, %-I:%M %p") if msg["sent"] else msg.get("sent_raw", "")
     centered_text(d, W / 2, 40, when, font("default_medium", 12), DIM)
     d.line([16, 62, W - 16, 62], fill=LINE)
 
@@ -6771,7 +6810,9 @@ def mode_live():
     # so it keeps sampling even while that screen isn't open.
     refresher.add("celldet", get_cellular_detail, 5)
     refresher.add("sms", get_sms_messages, 15)
-    refresher.add("rep", get_repeater_status, 30)
+    # Full pace even while asleep: it carries the hotel-portal flag that
+    # wakes the screen (see the asleep branch of the main loop).
+    refresher.add("rep", get_repeater_status, 30, asleep_factor=1)
     refresher.add("wg_peers", get_wireguard_peers, 120)
     # Shorter than the other 20-30s polls here on purpose: this is a
     # "connected right now?" indicator shown directly on the SIM page,
@@ -6877,11 +6918,36 @@ def mode_live():
         with touch_state.lock:      # if the sleep didn't take, retry after
             touch_state.last_touch = time.time()   # another full timeout
 
+    # Fork: alerts wake a sleeping screen. While asleep the main loop only
+    # watches the two things worth lighting the screen for -- the WAN
+    # carrying traffic changed, or a hotel login page appeared -- and on
+    # either turns the panel on at Home, where the normal banner code
+    # (which still sees the old last_wan_dev / last_portal) shows it. If
+    # nothing is touched, the screen goes back off after ALERT_ON_S.
+    ALERT_ON_S = 12.0
+    ALERT_POLL_S = 3.0
+    alert_wake = {"at": 0.0, "base": 0.0, "next_check": 0.0}
+
+    def wake_for_alert():
+        nonlocal view, panel_idx
+        run(["/root/dashboard/screen_sleep.sh", "on"], timeout=5)
+        _asleep_cache["ts"] = 0.0
+        view = "main"
+        panel_idx = 0
+        with touch_state.lock:
+            alert_wake["base"] = touch_state.last_touch
+        alert_wake["at"] = time.time()
+
     def undim():
         if dim["on"]:
             if dim["restore"]:
                 _bl_write(dim["restore"], save=True)
             dim.update(on=False, restore=None, level=None)
+        if alert_wake["at"]:
+            # woken for an alert: a banner restarts the alert window rather
+            # than faking a touch, so it still goes dark ALERT_ON_S later
+            alert_wake["at"] = time.time()
+            return
         with touch_state.lock:
             touch_state.last_touch = time.time()
 
@@ -7656,6 +7722,7 @@ def mode_live():
             return "Data is still up -- the change didn't take"
         return stage.get("fail") or "Roaming setting didn't save"
 
+    was_asleep = False
     while not _stop:
         now = time.time()
 
@@ -7666,8 +7733,19 @@ def mode_live():
                 # power-button wake doesn't land straight in the dimmed state
                 touch_state.last_touch = time.time()
             dim.update(on=False, restore=None, level=None)
-            time.sleep(0.1)
+            was_asleep = True
+            if now >= alert_wake["next_check"]:
+                alert_wake["next_check"] = now + ALERT_POLL_S
+                portal_now = bool((refresher.get("rep") or {}).get("portal"))
+                if get_wan_iface() != last_wan_dev or (portal_now and not last_portal):
+                    wake_for_alert()
+                    continue
+            time.sleep(0.25)   # power-button wakes are lit by button_watch; this only notices
             continue
+        if was_asleep:
+            was_asleep = False
+            refresher.refresh_all()
+            last_draw = 0.0
 
         # Fork: idle auto-dim / wake-on-touch.
         if dim["on"]:
@@ -7686,6 +7764,14 @@ def mode_live():
             if _bl_read() not in (dim["level"], 0):
                 # brightness changed elsewhere (power-button wake, GL): stand down
                 dim.update(on=False, restore=None, level=None)
+        elif alert_wake["at"]:
+            with touch_state.lock:
+                touched = touch_state.active or touch_state.last_touch > alert_wake["base"] + 0.5
+            if touched:
+                alert_wake["at"] = 0.0          # user took over: normal timeout from here
+            elif now - alert_wake["at"] > ALERT_ON_S:
+                alert_wake["at"] = 0.0
+                sleep_screen()
         elif dim_after() > 0 and view not in ("speedtest", "game"):
             with touch_state.lock:
                 idle_for = now - touch_state.last_touch
