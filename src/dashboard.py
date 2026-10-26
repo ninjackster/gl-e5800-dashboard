@@ -3484,6 +3484,430 @@ def panel_devices(devs):
     return img
 
 
+# ---------- QR code encoder (fork) ----------
+# Byte mode, versions 1-40, all four ECC levels. No QR library ships on the
+# Mudi (gl_screen draws its Wi-Fi QR inside its own C binary), so the Share
+# Wi-Fi and Hotel login screens use this. Follows ISO/IEC 18004 the same way
+# Project Nayuki's reference encoder does.
+
+_QR_ECC_PER_BLOCK = {
+    "L": (-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28,
+          28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30),
+    "M": (-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26,
+          26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28),
+    "Q": (-1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30,
+          28, 30, 30, 30, 30, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30),
+    "H": (-1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28,
+          30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30),
+}
+_QR_NUM_BLOCKS = {
+    "L": (-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8,
+          8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25),
+    "M": (-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16,
+          17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49),
+    "Q": (-1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20,
+          23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68),
+    "H": (-1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25,
+          25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81),
+}
+_QR_FORMAT_BITS = {"L": 1, "M": 0, "Q": 3, "H": 2}
+
+
+def _qr_raw_modules(ver):
+    n = (16 * ver + 128) * ver + 64
+    if ver >= 2:
+        na = ver // 7 + 2
+        n -= (25 * na - 10) * na - 55
+        if ver >= 7:
+            n -= 36
+    return n
+
+
+def _qr_data_codewords(ver, ecl):
+    return _qr_raw_modules(ver) // 8 - _QR_ECC_PER_BLOCK[ecl][ver] * _QR_NUM_BLOCKS[ecl][ver]
+
+
+def _qr_gf_mul(x, y):
+    z = 0
+    for i in reversed(range(8)):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z
+
+
+def _qr_rs_divisor(degree):
+    result = [0] * (degree - 1) + [1]
+    root = 1
+    for _ in range(degree):
+        for j in range(degree):
+            result[j] = _qr_gf_mul(result[j], root)
+            if j + 1 < degree:
+                result[j] ^= result[j + 1]
+        root = _qr_gf_mul(root, 0x02)
+    return result
+
+
+def _qr_rs_remainder(data, divisor):
+    result = [0] * len(divisor)
+    for b in data:
+        factor = b ^ result.pop(0)
+        result.append(0)
+        for i, coef in enumerate(divisor):
+            result[i] ^= _qr_gf_mul(coef, factor)
+    return result
+
+
+def qr_matrix(text, ecl="M", min_version=1, max_version=40):
+    """The QR code for text as rows of booleans (True = dark), no quiet zone.
+    Raises ValueError if it does not fit in max_version."""
+    data = text.encode("utf-8")
+    for ver in range(min_version, max_version + 1):
+        count_bits = 8 if ver <= 9 else 16
+        if 4 + count_bits + 8 * len(data) <= _qr_data_codewords(ver, ecl) * 8:
+            break
+    else:
+        raise ValueError("text too long for a QR code")
+
+    bits = []
+
+    def put(val, n):
+        bits.extend((val >> i) & 1 for i in reversed(range(n)))
+
+    put(0b0100, 4)
+    put(len(data), count_bits)
+    for b in data:
+        put(b, 8)
+    cap = _qr_data_codewords(ver, ecl) * 8
+    put(0, min(4, cap - len(bits)))
+    put(0, -len(bits) % 8)
+    pad = 0xEC
+    while len(bits) < cap:
+        put(pad, 8)
+        pad ^= 0xEC ^ 0x11
+    codewords = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+
+    # Split into blocks, append ECC, interleave.
+    nblocks = _QR_NUM_BLOCKS[ecl][ver]
+    ecclen = _QR_ECC_PER_BLOCK[ecl][ver]
+    raw = _qr_raw_modules(ver) // 8
+    nshort = nblocks - raw % nblocks
+    shortlen = raw // nblocks
+    divisor = _qr_rs_divisor(ecclen)
+    blocks, k = [], 0
+    for i in range(nblocks):
+        dat = codewords[k:k + shortlen - ecclen + (0 if i < nshort else 1)]
+        k += len(dat)
+        ecc = _qr_rs_remainder(dat, divisor)
+        if i < nshort:
+            dat = dat + [0]
+        blocks.append(dat + ecc)
+    final = []
+    for i in range(len(blocks[0])):
+        for j, blk in enumerate(blocks):
+            if i != shortlen - ecclen or j >= nshort:
+                final.append(blk[i])
+
+    size = ver * 4 + 17
+    mods = [[False] * size for _ in range(size)]
+    func = [[False] * size for _ in range(size)]
+
+    def setf(x, y, dark):
+        mods[y][x] = dark
+        func[y][x] = True
+
+    for i in range(size):                                   # timing patterns
+        setf(6, i, i % 2 == 0)
+        setf(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):   # finders + separators
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                x, y = cx + dx, cy + dy
+                if 0 <= x < size and 0 <= y < size:
+                    setf(x, y, max(abs(dx), abs(dy)) not in (2, 4))
+    if ver > 1:                                             # alignment patterns
+        na = ver // 7 + 2
+        step = (ver * 8 + na * 3 + 5) // (na * 4 - 4) * 2
+        pos = list(reversed([size - 7 - i * step for i in range(na - 1)] + [6]))
+        for i, py in enumerate(pos):
+            for j, px in enumerate(pos):
+                if (i == 0 and j == 0) or (i == 0 and j == na - 1) or (i == na - 1 and j == 0):
+                    continue
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        setf(px + dx, py + dy, max(abs(dx), abs(dy)) != 1)
+
+    def draw_format(mask):
+        dat = _QR_FORMAT_BITS[ecl] << 3 | mask
+        rem = dat
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        fb = (dat << 10 | rem) ^ 0x5412
+        bit = lambda i: (fb >> i) & 1 != 0
+        for i in range(6):
+            setf(8, i, bit(i))
+        setf(8, 7, bit(6))
+        setf(8, 8, bit(7))
+        setf(7, 8, bit(8))
+        for i in range(9, 15):
+            setf(14 - i, 8, bit(i))
+        for i in range(8):
+            setf(size - 1 - i, 8, bit(i))
+        for i in range(8, 15):
+            setf(8, size - 15 + i, bit(i))
+        setf(8, size - 8, True)
+
+    draw_format(0)                                          # reserve the area
+    if ver >= 7:
+        rem = ver
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        vb = ver << 12 | rem
+        for i in range(18):
+            dark = (vb >> i) & 1 != 0
+            a, b = size - 11 + i % 3, i // 3
+            setf(a, b, dark)
+            setf(b, a, dark)
+
+    i = 0                                                   # zigzag data fill
+    right = size - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        for vert in range(size):
+            for j in range(2):
+                x = right - j
+                upward = ((right + 1) & 2) == 0
+                y = size - 1 - vert if upward else vert
+                if not func[y][x] and i < len(final) * 8:
+                    mods[y][x] = (final[i >> 3] >> (7 - (i & 7))) & 1 != 0
+                    i += 1
+        right -= 2
+
+    masks = (
+        lambda x, y: (x + y) % 2 == 0,
+        lambda x, y: y % 2 == 0,
+        lambda x, y: x % 3 == 0,
+        lambda x, y: (x + y) % 3 == 0,
+        lambda x, y: (x // 3 + y // 2) % 2 == 0,
+        lambda x, y: x * y % 2 + x * y % 3 == 0,
+        lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+        lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0,
+    )
+
+    def apply_mask(m):
+        f = masks[m]
+        for y in range(size):
+            for x in range(size):
+                if not func[y][x] and f(x, y):
+                    mods[y][x] = not mods[y][x]
+
+    def penalty():
+        # Rules 1, 2 and 4 of the spec. Rule 3 (finder look-alikes) is left
+        # out: any mask decodes, the score only picks the cleanest one.
+        p = 0
+        for grid in (mods, list(zip(*mods))):
+            for row in grid:
+                run, prev = 0, None
+                for c in row:
+                    if c == prev:
+                        run += 1
+                        if run == 5:
+                            p += 3
+                        elif run > 5:
+                            p += 1
+                    else:
+                        run, prev = 1, c
+        for y in range(size - 1):
+            for x in range(size - 1):
+                c = mods[y][x]
+                if c == mods[y][x + 1] == mods[y + 1][x] == mods[y + 1][x + 1]:
+                    p += 3
+        dark = sum(map(sum, mods))
+        total = size * size
+        p += (abs(dark * 20 - total * 10) + total - 1) // total * 10 - 10 if dark * 20 != total * 10 else 0
+        return p
+
+    best, best_p = 0, None
+    for m in range(8):
+        apply_mask(m)
+        draw_format(m)
+        pen = penalty()
+        if best_p is None or pen < best_p:
+            best, best_p = m, pen
+        apply_mask(m)                                       # XOR undoes it
+    apply_mask(best)
+    draw_format(best)
+    return mods
+
+
+def draw_qr(d, matrix, x, y, size):
+    """White card with the code centred at the largest whole-pixel module
+    size that fits, keeping the spec's 4-module quiet zone."""
+    n = len(matrix)
+    px = max(1, size // (n + 8))
+    side = px * (n + 8)
+    ox, oy = x + (size - side) // 2, y + (size - side) // 2
+    d.rounded_rectangle([ox, oy, ox + side - 1, oy + side - 1], radius=6, fill=(255, 255, 255))
+    for r, row in enumerate(matrix):
+        for c, dark in enumerate(row):
+            if dark:
+                x0, y0 = ox + (c + 4) * px, oy + (r + 4) * px
+                d.rectangle([x0, y0, x0 + px - 1, y0 + px - 1], fill=(0, 0, 0))
+
+
+# ---------- Share Wi-Fi (fork) ----------
+# A QR a phone camera joins from: GL's web UI has one, but only for a device
+# that is already connected and logged in to the admin page.
+WIFI_SHARE_IFACES = (("wifi2g", "2.4"), ("wifi5g", "5"), ("wifi6g", "6"))
+WIFI_QR_BOX = (28, 42, 184)                     # x, y, size
+WIFI_PW_RECT = (16, 270, W - 16, 298)
+
+
+def get_wifi_share():
+    """The Mudi's own (non-guest) Wi-Fi: SSID, key, security, live bands."""
+    info = {"ssid": None, "key": "", "enc": "none", "hidden": False, "bands": []}
+    for iface, band in WIFI_SHARE_IFACES:
+        ok, out = run_checked(["uci", "-q", "show", f"wireless.{iface}"])
+        if not ok:
+            continue
+        opts = {}
+        for line in out.splitlines():
+            k, _, v = line.partition("=")
+            opts[k.rsplit(".", 1)[-1]] = v.strip("'")
+        if opts.get("mode") != "ap" or opts.get("disabled") == "1":
+            continue
+        info["bands"].append(band)
+        if info["ssid"] is None:
+            info.update(ssid=opts.get("ssid"), key=opts.get("key", ""),
+                        enc=opts.get("encryption", "none"), hidden=opts.get("hidden") == "1")
+    return info
+
+
+def wifi_qr_text(info):
+    """The WIFI: payload phone cameras understand."""
+    special = set(chr(92) + ';,:"')     # backslash ; , : " must be escaped
+    esc = lambda s: "".join(chr(92) + ch if ch in special else ch for ch in (s or ""))
+    open_net = info["enc"] in ("none", "owe", "") or not info["key"]
+    kind = "nopass" if open_net else "WPA"
+    text = f"WIFI:T:{kind};S:{esc(info['ssid'])};"
+    if not open_net:
+        text += f"P:{esc(info['key'])};"
+    if info["hidden"]:
+        text += "H:true;"
+    return text + ";"
+
+
+def panel_wifi_share(info, reveal=False):
+    img, d = new_canvas()
+    accent = ACCENT["clock"]
+    draw_back_header(d, "Share Wi-Fi", accent)
+    if not info or not info.get("ssid"):
+        centered_text(d, W / 2, 140, "Wi-Fi is off", font("default_medium", 15), DIM)
+        return img
+    x, y, size = WIFI_QR_BOX
+    draw_qr(d, qr_matrix(wifi_qr_text(info), "M"), x, y, size)
+    f_s = font("default_bold", 16)
+    centered_text(d, W / 2, 232, truncate_to_width(d, info["ssid"], f_s, W - 32), f_s, FG)
+    bands = " + ".join(info["bands"]) + " GHz"
+    sec = "open" if info["enc"] in ("none", "owe", "") else ("WPA3" if "sae" in info["enc"] else "WPA2")
+    centered_text(d, W / 2, 252, f"{bands} · {sec}", font("default_medium", 11), DIM)
+    px0, py0, px1, py1 = WIFI_PW_RECT
+    glass(d, [px0, py0, px1, py1], radius=8, outline=SURFACE_EDGE)
+    f_k = font("default_medium", 12)
+    d.text((px0 + 10, py0 + 7), "Password", font=f_k, fill=DIM)
+    if sec == "open":
+        val, col = "none", DIM
+    elif reveal:
+        val, col = truncate_to_width(d, info["key"], f_k, (px1 - px0) - 90), FG
+    else:
+        val, col = "Tap to show", accent
+    d.text((px1 - 10 - d.textlength(val, font=f_k), py0 + 7), val, font=f_k, fill=col)
+    centered_text(d, W / 2, H - 15, "Point a phone camera at the code", font("default_medium", 10), DIM)
+    return img
+
+
+def hit_wifi_share(x, y):
+    px0, py0, px1, py1 = WIFI_PW_RECT
+    if px0 <= x <= px1 and py0 - 6 <= y <= py1 + 6:
+        return "reveal"
+    return None
+
+
+# ---------- Hotel login helper (fork) ----------
+# GL's repeater flags a captive portal but cannot sign in for you; the login
+# has to happen on a phone or laptop behind the Mudi. This probes the hotel
+# network for the real login address and shows it as a QR, so a phone on the
+# Mudi's Wi-Fi can open it in one scan.
+PORTAL_PROBE_URL = "http://neverssl.com/"
+PORTAL_QR_BOX = (40, 60, 160)
+PORTAL_LIST_LINK = (50, 250, W - 50, 266)
+PORTAL_RECHECK_RECT = (16, 276, 116, 306)
+PORTAL_SHARE_RECT = (124, 276, W - 16, 306)
+PORTAL_AMBER = (240, 180, 80)
+
+
+def get_portal_login():
+    """Ask the hotel network itself where it redirects a plain-HTTP page.
+    Probes out of the repeater interface even when failover has moved the
+    default route to cellular, since only the hotel uplink sees the portal."""
+    dev = ubus_call("network.interface.wwan", "status").get("l3_device")
+    url = None
+    if dev:
+        out = run(["curl", "-s", "-m", "6", "--interface", dev, "-o", "/dev/null",
+                   "-w", "%{http_code} %{redirect_url}", PORTAL_PROBE_URL], timeout=10)
+        code, _, loc = out.strip().partition(" ")
+        if code.startswith("30") and loc.startswith(("http://", "https://")):
+            url = loc
+    return {"url": url, "ts": time.time()}
+
+
+def panel_portal_help(rep, login, mudi_ssid=None):
+    img, d = new_canvas()
+    draw_back_header(d, "Hotel login", PORTAL_AMBER)
+    rep = rep or {}
+    hotel = rep.get("ssid") or "This network"
+    f_t = font("default_bold", 13)
+    if not rep.get("portal"):
+        title, tcol = (f"Signed in to {hotel}", (70, 240, 170)) if rep.get("connected") else (f"{hotel}: not connected", DIM)
+    else:
+        title, tcol = f"{hotel} needs a sign-in", PORTAL_AMBER
+    centered_text(d, W / 2, 40, truncate_to_width(d, title, f_t, W - 24), f_t, tcol)
+    url = (login or {}).get("url")
+    x, y, size = PORTAL_QR_BOX
+    if rep.get("portal"):
+        draw_qr(d, qr_matrix(url or PORTAL_PROBE_URL, "L"), x, y, size)
+        who = f"a phone on {mudi_ssid}" if mudi_ssid else "a phone on this Mudi's Wi-Fi"
+        centered_text(d, W / 2, 224, truncate_to_width(d, f"Scan with {who}", font("default_medium", 11), W - 20),
+                      font("default_medium", 11), FG)
+        shown = url or "neverssl.com · then follow the redirect"
+        if login is None:
+            shown = "Finding the login page…"
+        centered_text(d, W / 2, 238, truncate_to_width(d, shown, font("default_medium", 10), W - 24),
+                      font("default_medium", 10), DIM)
+    else:
+        centered_text(d, W / 2, 140, "Internet is up through the hotel" if rep.get("connected") else "Repeater is down",
+                      font("default_medium", 13), DIM)
+    lx0, ly0, lx1, ly1 = PORTAL_LIST_LINK
+    centered_text(d, W / 2, ly0, "Other networks ›", font("default_medium", 12), ACCENT["clock"])
+    for (bx0, by0, bx1, by1), label, filled in ((PORTAL_RECHECK_RECT, "Re-check", False),
+                                                (PORTAL_SHARE_RECT, "Share Wi-Fi", True)):
+        if filled:
+            d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, fill=PORTAL_AMBER)
+            centered_text_box(d, bx0, by0, bx1, by1, label, font("default_bold", 13), BG)
+        else:
+            d.rounded_rectangle([bx0, by0, bx1, by1], radius=8, outline=PORTAL_AMBER, width=2)
+            centered_text_box(d, bx0, by0, bx1, by1, label, font("default_bold", 13), PORTAL_AMBER)
+    return img
+
+
+def hit_portal_help(x, y):
+    for zone, (x0, y0, x1, y1) in (("recheck", PORTAL_RECHECK_RECT), ("share", PORTAL_SHARE_RECT),
+                                   ("list", PORTAL_LIST_LINK)):
+        if x0 <= x <= x1 and y0 - 6 <= y <= y1 + 6:
+            return zone
+    return None
+
+
 # ---------- quick settings shade (fork) ----------
 # Pulled down from the top edge on any main page. Brightness writes the
 # backlight and screen_sleep.sh's saved level, so a sleep/wake keeps it.
@@ -5132,7 +5556,8 @@ MORE_WIFI24_TOGGLE = (176, 37, 224, 63)
 MORE_WIFI56_SEG = (16, 104, 224, 128)
 MORE_SMS_RECT = (16, 166, W - 16, 216)   # fork: Messages moved here from Home
 MORE_CLOCK_STYLE_SEG = (16, 184, 224, 208)
-MORE_RETURN_STOCK_RECT = (16, 232, W - 16, 266)
+MORE_SHARE_WIFI_RECT = (16, 232, 116, 266)          # fork: Wi-Fi QR
+MORE_RETURN_STOCK_RECT = (124, 232, W - 16, 266)    # fork: was full width
 MORE_REBOOT_RECT = (16, 272, 116, 306)
 MORE_SHUTDOWN_RECT = (124, 272, W - 16, 306)
 
@@ -5177,9 +5602,13 @@ def panel_more(wifi24, wifi_band, clock_style, wifi56_disabled_idx=None, sms_mes
     else:
         d.text((sx0 + 48, sy0 + 27), "No messages", font=font("default_medium", 11), fill=DIM)
 
+    rx0, ry0, rx1, ry1 = MORE_SHARE_WIFI_RECT
+    d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, fill=ACCENT["clock"])
+    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Share Wi-Fi", font("default_bold", 14), BG)
+
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=ACCENT["clock"], width=2)
-    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Return to Stock UI", font("default_bold", 14), ACCENT["clock"])
+    centered_text(d, (rx0 + rx1) / 2, ry0 + 10, "Stock UI", font("default_bold", 14), ACCENT["clock"])
 
     rx0, ry0, rx1, ry1 = MORE_REBOOT_RECT
     d.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, outline=(200, 80, 80), width=2)
@@ -5206,6 +5635,9 @@ def hit_more(x, y, wifi56_disabled_idx=None):
     mx0, my0, mx1, my1 = MORE_SMS_RECT
     if mx0 <= x <= mx1 and my0 <= y <= my1:
         return "sms"
+    rx0, ry0, rx1, ry1 = MORE_SHARE_WIFI_RECT
+    if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+        return "share_wifi"
     rx0, ry0, rx1, ry1 = MORE_RETURN_STOCK_RECT
     if rx0 <= x <= rx1 and ry0 <= y <= ry1:
         return "return_stock"
@@ -6623,6 +7055,18 @@ def mode_preview(outdir):
             {"name": "Mac", "ip": "192.168.2.165", "iface": "5G", "down": 1800000, "up": 90000},
             {"name": "iPhone", "ip": "192.168.2.120", "iface": "5G", "down": 42000, "up": 9000}])),
         ("networks_portal", panel_networks(get_networks_state(), dict(rep, portal=True))),
+        # Fork: demo Wi-Fi details, so the real key never lands in a preview PNG.
+        ("wifi_share", panel_wifi_share({"ssid": "onichan", "key": "example-pass-123", "enc": "psk2+ccmp",
+                                         "hidden": False, "bands": ["2.4", "5"]})),
+        ("wifi_share_revealed", panel_wifi_share({"ssid": "onichan", "key": "example-pass-123",
+                                                  "enc": "psk2+ccmp", "hidden": False, "bands": ["2.4", "5"]}, True)),
+        ("portal_help", panel_portal_help({"connected": True, "ssid": "Hyatt-Guest", "portal": True},
+                                          None, "onichan")),
+        ("portal_help_found", panel_portal_help({"connected": True, "ssid": "Hyatt-Guest", "portal": True},
+                                                {"url": "https://portal.example-hotel.com/login?mac=AA:BB:CC:DD:EE:FF&ip=10.1.2.3"},
+                                                "onichan")),
+        ("portal_help_signed_in", panel_portal_help({"connected": True, "ssid": "Hyatt-Guest", "portal": False},
+                                                    {"url": None}, "onichan")),
         ("more", panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)),
         ("repeater", panel_repeater(rep, rep_networks)),
         ("confirm", panel_confirm("Reboot", "Reboot the router now?", ACCENT["clock"], yes_label="Reboot", danger=True)),
@@ -6899,6 +7343,10 @@ def mode_live():
     refresher.add("cellsig", get_cellular_signal, SUB_IDLE_S, run_now=False)
     refresher.add("nets", get_networks_state, SUB_IDLE_S, run_now=False)
     refresher.add("devices", get_devices, SUB_IDLE_S, run_now=False)
+    # Hotel login: probe for the portal's address while the helper is open,
+    # and poll the repeater faster there so "Signed in" shows promptly.
+    PORTAL_OPEN_S, REP_FAST_S, REP_NORMAL_S = 20, 5, 30
+    refresher.add("portal", get_portal_login, SUB_IDLE_S, run_now=False)
     sub_intervals = {}
     refresher.add("sms", get_sms_messages, 15)
     # Full pace even while asleep: it carries the hotel-portal flag that
@@ -6951,6 +7399,8 @@ def mode_live():
     sub_notice_until = 0.0     # when the notice painted on a sub-screen expires
     cell_sig_seen = None       # last aiming-mode sample seen from the refresher
     cell_det_seen = None       # last full cellular detail seen from the refresher
+    wifi_share, wifi_reveal, wifi_share_return = None, False, "more"   # fork: Share Wi-Fi
+    portal_login = None        # fork: hotel login probe result (None = still looking)
     last_portal = False
     if last_wan_dev and "rmnet" in last_wan_dev:
         _cell_session.update(dev=last_wan_dev, start_bytes=_dev_bytes(last_wan_dev))
@@ -7114,7 +7564,7 @@ def mode_live():
             last_wan_dev = wan_dev
         if cur_rep.get("portal") and not last_portal:
             undim()
-            show_notice("Hotel login needed · open any website", 12.0)
+            show_notice("Hotel login needed · Networks › Repeater", 12.0)
         last_portal = bool(cur_rep.get("portal"))
 
     def render_main(idx):
@@ -7904,6 +8354,13 @@ def mode_live():
                 portal_now = bool((refresher.get("rep") or {}).get("portal"))
                 if (wan_seeded and stable_wan() != last_wan_dev) or (portal_now and not last_portal):
                     wake_for_alert()
+                    if portal_now and not last_portal:
+                        # Fork: a new hotel login wakes straight into the helper.
+                        rep = refresher.get("rep", rep)
+                        portal_login = None
+                        refresher.request("portal")
+                        view = "portal_help"
+                        sub_dirty = True
                     continue
             time.sleep(0.25)   # power-button wakes are lit by button_watch; this only notices
             continue
@@ -7921,7 +8378,9 @@ def mode_live():
         for job, want in (("celldet", CELLDET_OPEN_S if view == "cellular" else CELLDET_BG_S),
                           ("cellsig", CELLSIG_OPEN_S if view == "cellular" else SUB_IDLE_S),
                           ("nets", NETS_OPEN_S if in_networks else SUB_IDLE_S),
-                          ("devices", DEVICES_OPEN_S if view == "devices" else SUB_IDLE_S)):
+                          ("devices", DEVICES_OPEN_S if view == "devices" else SUB_IDLE_S),
+                          ("portal", PORTAL_OPEN_S if view == "portal_help" else SUB_IDLE_S),
+                          ("rep", REP_FAST_S if view == "portal_help" else REP_NORMAL_S)):
             if sub_intervals.get(job) != want:
                 sub_intervals[job] = want
                 refresher.set_interval(job, want)
@@ -8452,6 +8911,18 @@ def mode_live():
                         cell_det.update(cell_sig_seen)    # aiming sample is newer
                     sub_dirty = True
 
+            if view == "portal_help":
+                fresh_rep = refresher.get("rep")
+                if fresh_rep is not None and fresh_rep is not rep:
+                    if rep.get("portal") and not fresh_rep.get("portal") and fresh_rep.get("connected"):
+                        show_notice("Signed in · hotel internet is up", 8.0)
+                    rep = fresh_rep
+                    sub_dirty = True
+                fresh_login = refresher.get("portal")
+                if fresh_login is not None and fresh_login is not portal_login:
+                    portal_login = fresh_login
+                    sub_dirty = True
+
             if sub_notice_until and now >= sub_notice_until:
                 sub_notice_until = 0.0
                 sub_dirty = True        # repaint without the expired notice
@@ -8466,6 +8937,10 @@ def mode_live():
                            else panel_net_detail(net, net_detail_key))
                 elif view == "cellular":
                     img = panel_cellular(cell_det)
+                elif view == "wifi_share":
+                    img = panel_wifi_share(wifi_share, wifi_reveal)
+                elif view == "portal_help":
+                    img = panel_portal_help(rep, portal_login, (wifi_share or {}).get("ssid"))
                 elif view == "more":
                     img = panel_more(wifi24, wifi_band, cfg["clock_style"], get_wifi56_conflict_idx(rep), sms_messages)
                 elif view == "confirm":
@@ -8649,6 +9124,37 @@ def mode_live():
                 elif view == "sms_detail" and is_tap and hit_back(down_y):
                     view = "sms"
                     sub_dirty = True
+                elif is_tap and view == "wifi_share":
+                    if hit_back(down_y):
+                        view = wifi_share_return
+                        wifi_reveal = False
+                        sub_dirty = True
+                    elif hit_wifi_share(down_x, down_y) == "reveal":
+                        wifi_reveal = not wifi_reveal
+                        sub_dirty = True
+                elif is_tap and view == "portal_help":
+                    zone = None if hit_back(down_y) else hit_portal_help(down_x, down_y)
+                    if hit_back(down_y):
+                        view = "networks"
+                        net = refresher.get("nets", net)
+                        refresher.request("nets")
+                        sub_dirty = True
+                    elif zone == "recheck":
+                        portal_login = None
+                        refresher.request("rep")
+                        refresher.request("portal")
+                        show_notice("Checking the hotel network…", 4.0)
+                    elif zone == "share":
+                        wifi_share = run_with_spinner(panel_portal_help(rep, portal_login), "Loading…",
+                                                      get_wifi_share, ACCENT["clock"]) or wifi_share
+                        wifi_reveal, wifi_share_return = False, "portal_help"
+                        view = "wifi_share"
+                        sub_dirty = True
+                    elif zone == "list":
+                        picker_scroll_base = 0
+                        start_repeater_scan()
+                        view = "repeater"
+                        sub_dirty = True
                 elif is_tap and view in ("net_detail", "cellular") and hit_back(down_y):
                     view = "networks"
                     net = refresher.get("nets", net)
@@ -8657,10 +9163,19 @@ def mode_live():
                 elif is_tap and view == "networks" and not hit_back(down_y):
                     key = hit_networks(down_x, down_y, net)
                     if key == "wwan":
-                        picker_scroll_base = 0
                         rep = get_repeater_status()
-                        start_repeater_scan()
-                        view = "repeater"
+                        if rep.get("portal"):
+                            # Fork: a pending hotel login goes to the helper;
+                            # its "Other networks" link reaches the list.
+                            portal_login = None
+                            wifi_share = wifi_share or {"ssid": uci_get("wireless.wifi2g.ssid", "") or None}
+                            refresher.put("rep", rep)
+                            refresher.request("portal")
+                            view = "portal_help"
+                        else:
+                            picker_scroll_base = 0
+                            start_repeater_scan()
+                            view = "repeater"
                         sub_dirty = True
                     elif key == "modem_cpu":
                         # Four ubus calls: under the spinner, not a frozen frame.
@@ -8779,6 +9294,12 @@ def mode_live():
                     elif action == "clock_digital" and cfg["clock_style"] != "digital":
                         cfg["clock_style"] = "digital"
                         save_config(cfg)
+                        sub_dirty = True
+                    elif action == "share_wifi":
+                        wifi_share = run_with_spinner(more_img, "Loading…", get_wifi_share,
+                                                      ACCENT["clock"]) or wifi_share
+                        wifi_reveal, wifi_share_return = False, "more"
+                        view = "wifi_share"
                         sub_dirty = True
                     elif action == "return_stock":
                         confirm_title = "Stock UI"
