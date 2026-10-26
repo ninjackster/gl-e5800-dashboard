@@ -529,6 +529,15 @@ class Refresher:
             job[3] = 0.0
         self._wake.set()
 
+    def set_interval(self, name, interval):
+        """Fork: change a job's period. A shorter period takes effect now
+        rather than after the old, longer wait runs out."""
+        for job in self._jobs:
+            if job[0] == name and job[2] != interval:
+                job[2] = interval
+                job[3] = min(job[3], time.time() + interval)
+                self._wake.set()
+
     def request(self, name):
         """Ask for one job to run as soon as the worker next wakes."""
         for job in self._jobs:
@@ -2964,6 +2973,9 @@ def run_with_spinner(base_img, label, fn, accent=None, min_visible=0.4, fps=30):
     # land on a screen the user never saw.
     with touch_state.lock:
         touch_state.release_pending = False
+        # Fork: the wait counts as use. A 60s Reconnect otherwise left the
+        # idle timer expired, so the screen slept before showing the result.
+        touch_state.last_touch = time.time()
     return box.get("value")
 
 
@@ -3485,7 +3497,9 @@ def get_brightness_pct():
         return None
 
 
-def set_brightness_pct(pct):
+def set_brightness_pct(pct, save=True):
+    """save=False during a slider drag: only the release writes
+    .backlight_saved, so a drag doesn't rewrite a flash file per step."""
     pct = max(BRIGHTNESS_MIN_PCT, min(100, int(pct)))
     try:
         mx = int(_read_sys(f"{BL_DIR}/max_brightness") or 0)
@@ -3494,8 +3508,9 @@ def set_brightness_pct(pct):
         level = max(1, round(mx * pct / 100))
         with open(f"{BL_DIR}/brightness", "w") as f:
             f.write(str(level))
-        with open(BL_SAVED, "w") as f:
-            f.write(str(level))
+        if save:
+            with open(BL_SAVED, "w") as f:
+                f.write(str(level))
         return pct
     except Exception:
         return None
@@ -3585,6 +3600,7 @@ NET_TOGGLE_RECT = (172, 42, 218, 64)
 CELL_RECONNECT_RECT = (16, 278, 116, 306)
 CELL_SIM_RECT = (124, 278, W - 16, 306)
 CELL_HISTORY_MAX = 120      # 5s refresher ticks -> 10 minutes
+CELL_HISTORY_S = 600        # the screen says "last 10 min": trim by age, not count
 _cell_history = []
 
 
@@ -3653,9 +3669,12 @@ def get_cellular_detail():
         "up": bool(iface.get("up")), "uptime": iface.get("uptime") if iface.get("up") else None,
         "cell": _parse_cell_signal(raw) if "signal" in raw else {},
     }
+    now = time.time()
     if det["rsrp"] is not None and det["rsrp"] > -200:
-        _cell_history.append((time.time(), det["rsrp"], det["sinr"]))
-        del _cell_history[:-CELL_HISTORY_MAX]
+        _cell_history.append((now, det["rsrp"], det["sinr"]))
+    # Polling slows down when the Cellular screen is closed or asleep, so a
+    # count cap alone let 120 samples stretch to 40+ minutes.
+    _cell_history[:] = [h for h in _cell_history if now - h[0] <= CELL_HISTORY_S][-CELL_HISTORY_MAX:]
     det["history"] = list(_cell_history)
     return det
 
@@ -4036,7 +4055,22 @@ def get_tailscale_state():
     """'exit' = routing through an exit node that is online, 'exit_offline'
     = an exit node is set but offline, 'up' = running without an exit node,
     'down' = not running. Tailscale stays on, so only the exit node lights
-    the Home badge."""
+    the Home badge.
+
+    Fork: cached for TAILSCALE_TTL_S. The travel job runs every 5s and the
+    Go CLI is the most expensive thing in it."""
+    now = time.time()
+    if now - _tailscale_cache["ts"] < TAILSCALE_TTL_S:
+        return _tailscale_cache["val"]
+    _tailscale_cache.update(ts=now, val=_tailscale_state_uncached())
+    return _tailscale_cache["val"]
+
+
+TAILSCALE_TTL_S = 30
+_tailscale_cache = {"ts": 0.0, "val": "down"}
+
+
+def _tailscale_state_uncached():
     out = run(["tailscale", "status", "--json"], timeout=5)
     try:
         j = json.loads(out)
@@ -6807,8 +6841,13 @@ def mode_live():
     # 5s: Speedify and the ranch tunnel also change from the GL UI and LuCI.
     refresher.add("travel", get_travel_status, 5)
     # Cellular detail feeds the Cellular screen's 10-minute signal history,
-    # so it keeps sampling even while that screen isn't open.
-    refresher.add("celldet", get_cellular_detail, 5)
+    # so it keeps sampling even while that screen isn't open -- at
+    # CELLDET_BG_S then, CELLDET_OPEN_S while the screen is showing (the
+    # main loop switches it). Its four ubus calls every 5s around the clock
+    # repeated the "cell" job's two.
+    CELLDET_OPEN_S, CELLDET_BG_S = 5, 30
+    refresher.add("celldet", get_cellular_detail, CELLDET_BG_S)
+    celldet_interval = CELLDET_BG_S
     refresher.add("sms", get_sms_messages, 15)
     # Full pace even while asleep: it carries the hotel-portal flag that
     # wakes the screen (see the asleep branch of the main loop).
@@ -6848,6 +6887,17 @@ def mode_live():
     devices = []
     last_dev_fetch = 0.0
     last_wan_dev = get_wan_iface()     # fork: failover alerts
+    # Started before any default route existed (boot): the first route to
+    # appear is the starting state, not a failover worth a banner.
+    wan_seeded = last_wan_dev is not None
+    # A missing default route only counts as "No internet" after this long.
+    # Redials and netifd route reshuffles drop it for a second or two, which
+    # fired "No internet" / "Switched to ..." pairs and reset the cellular
+    # data count (seen in the logs: eth0 -> None -> eth0, three times).
+    WAN_NONE_GRACE_S = 10.0
+    wan_none_since = None
+    last_wan_check = 0.0
+    sub_notice_until = 0.0     # when the notice painted on a sub-screen expires
     last_portal = False
     if last_wan_dev and "rmnet" in last_wan_dev:
         _cell_session.update(dev=last_wan_dev, start_bytes=_dev_bytes(last_wan_dev))
@@ -6952,8 +7002,67 @@ def mode_live():
             touch_state.last_touch = time.time()
 
     def show_notice(text, seconds=NOTICE_SECONDS):
+        nonlocal sub_dirty
         notice["text"] = text
         notice["until"] = time.time() + seconds
+        if view != "main":
+            sub_dirty = True    # fork: sub-screens draw the notice too
+
+    def draw_notice(img):
+        """Paint the active notice over the bottom of img; True if drawn."""
+        if not (notice["text"] and time.time() < notice["until"]):
+            return False
+        d = ImageDraw.Draw(img)
+        f = font("default_medium", 11)
+        d.rectangle([0, H - 22, W, H], fill=(84, 62, 18))
+        centered_text(d, W / 2, H - 18, truncate_to_width(d, notice["text"], f, W - 12), f, (255, 230, 180))
+        return True
+
+    def stable_wan():
+        """get_wan_iface() with a missing route held off for WAN_NONE_GRACE_S."""
+        nonlocal wan_none_since
+        dev = get_wan_iface()
+        if dev is not None:
+            wan_none_since = None
+            return dev
+        if wan_none_since is None:
+            wan_none_since = time.time()
+        return None if time.time() - wan_none_since >= WAN_NONE_GRACE_S else last_wan_dev
+
+    def check_wan_change():
+        """Fork: failover and hotel-portal banners. Runs on every awake
+        screen, not just the Home carousel, so last_wan_dev never goes stale
+        while a sub-screen is open (that used to wake the screen for a
+        change the user had just made from Networks)."""
+        nonlocal last_wan_dev, last_portal, wan_seeded
+        cur_rep = refresher.get("rep") or {}
+        wan_dev = stable_wan()
+        if not wan_seeded:
+            if wan_dev:
+                wan_seeded = True
+                last_wan_dev = wan_dev
+                if "rmnet" in wan_dev:
+                    _cell_session.update(dev=wan_dev, start_bytes=_dev_bytes(wan_dev))
+        elif wan_dev != last_wan_dev:
+            if last_wan_dev and "rmnet" in last_wan_dev and not (wan_dev and "rmnet" in wan_dev):
+                used = cell_session_used()
+                msg = f"Back on {wan_label(wan_dev, cur_rep)}"
+                if used is not None:
+                    msg += f" · {_fmt_bytes(used)} on cellular"
+                _cell_session.update(dev=None, start_bytes=None)
+            elif wan_dev and "rmnet" in wan_dev:
+                _cell_session.update(dev=wan_dev, start_bytes=_dev_bytes(wan_dev))
+                msg = "Switched to Cellular"
+            else:
+                msg = f"Switched to {wan_label(wan_dev, cur_rep)}"
+            undim()
+            show_notice(msg, 10.0)
+            run(["logger", "-t", "dashboard", f"WAN change {last_wan_dev} -> {wan_dev}: {msg}"])
+            last_wan_dev = wan_dev
+        if cur_rep.get("portal") and not last_portal:
+            undim()
+            show_notice("Hotel login needed · open any website", 12.0)
+        last_portal = bool(cur_rep.get("portal"))
 
     def render_main(idx):
         img = _render_panel(idx)
@@ -6963,11 +7072,8 @@ def mode_live():
             d = ImageDraw.Draw(img)
             d.rectangle([0, H - 20, W, H], fill=(90, 26, 34))
             centered_text(d, W / 2, H - 17, err, font("default_medium", 11), (255, 220, 220))
-        elif notice["text"] and time.time() < notice["until"]:
-            d = ImageDraw.Draw(img)
-            f = font("default_medium", 11)
-            d.rectangle([0, H - 22, W, H], fill=(84, 62, 18))
-            centered_text(d, W / 2, H - 18, truncate_to_width(d, notice["text"], f, W - 12), f, (255, 230, 180))
+        else:
+            draw_notice(img)
         return img
 
     def _render_panel(idx):
@@ -7303,9 +7409,12 @@ def mode_live():
             last_draw = now
 
         if active and have_pos and hit_shade(down_x, down_y) == "slider":
-            want = shade_pct_at(down_x + dx)
+            # Clamp first: set_brightness_pct never goes below the floor, so
+            # an unclamped 0-7 never matched and re-wrote sysfs and redrew
+            # the shade on every ~12ms pass while a finger rested there.
+            want = max(BRIGHTNESS_MIN_PCT, shade_pct_at(down_x + dx))
             if want != shade_pct:
-                got = set_brightness_pct(want)
+                got = set_brightness_pct(want, save=False)
                 shade_pct = got if got is not None else shade_pct
                 write_frame(panel_shade(shade_pct, int(dim_after()), idle_action()))
         elif released:
@@ -7326,6 +7435,8 @@ def mode_live():
                 close()
                 run(["/root/dashboard/screen_sleep.sh", "off"], timeout=5)
             elif zone == "slider":
+                if shade_pct is not None:
+                    set_brightness_pct(shade_pct)   # persist once, on release
                 write_frame(panel_shade(shade_pct, int(dim_after()), idle_action()))
         elif sub_dirty:
             shade_pct = get_brightness_pct()
@@ -7737,7 +7848,7 @@ def mode_live():
             if now >= alert_wake["next_check"]:
                 alert_wake["next_check"] = now + ALERT_POLL_S
                 portal_now = bool((refresher.get("rep") or {}).get("portal"))
-                if get_wan_iface() != last_wan_dev or (portal_now and not last_portal):
+                if (wan_seeded and stable_wan() != last_wan_dev) or (portal_now and not last_portal):
                     wake_for_alert()
                     continue
             time.sleep(0.25)   # power-button wakes are lit by button_watch; this only notices
@@ -7746,6 +7857,16 @@ def mode_live():
             was_asleep = False
             refresher.refresh_all()
             last_draw = 0.0
+
+        if now - last_wan_check > 2:
+            last_wan_check = now
+            check_wan_change()
+
+        # Fork: the Cellular screen polls fast only while it is showing.
+        want_celldet = CELLDET_OPEN_S if view == "cellular" else CELLDET_BG_S
+        if want_celldet != celldet_interval:
+            celldet_interval = want_celldet
+            refresher.set_interval("celldet", want_celldet)
 
         # Fork: idle auto-dim / wake-on-touch.
         if dim["on"]:
@@ -7829,28 +7950,6 @@ def mode_live():
                         conn_type = get_wan_conn_type(_cell)
                         cell_signal = get_cell_signal(_cell)
                 if now - last_mon_check > 2:
-                    # Fork: banner when the connection carrying traffic changes.
-                    wan_dev = get_wan_iface()
-                    if wan_dev != last_wan_dev:
-                        if last_wan_dev and "rmnet" in last_wan_dev and not (wan_dev and "rmnet" in wan_dev):
-                            used = cell_session_used()
-                            msg = f"Back on {wan_label(wan_dev, rep)}"
-                            if used is not None:
-                                msg += f" · {_fmt_bytes(used)} on cellular"
-                            _cell_session.update(dev=None, start_bytes=None)
-                        elif wan_dev and "rmnet" in wan_dev:
-                            _cell_session.update(dev=wan_dev, start_bytes=_dev_bytes(wan_dev))
-                            msg = "Switched to Cellular"
-                        else:
-                            msg = f"Switched to {wan_label(wan_dev, rep)}"
-                        undim()
-                        show_notice(msg, 10.0)
-                        run(["logger", "-t", "dashboard", f"WAN change {last_wan_dev} -> {wan_dev}: {msg}"])
-                        last_wan_dev = wan_dev
-                    if rep.get("portal") and not last_portal:
-                        undim()
-                        show_notice("Hotel login needed · open any website", 12.0)
-                    last_portal = bool(rep.get("portal"))
                     net_sample, net_down, net_up = sample_bandwidth(net_sample)
                     cpu_sample, cpu_pct = sample_cpu(cpu_sample)
                     ram_pct, ram_used_gb, ram_total_gb = get_ram_stats()
@@ -8269,6 +8368,19 @@ def mode_live():
                 last_dev_fetch = now
                 sub_dirty = True
 
+            if view == "cellular":
+                # Fork: live signal while the screen is open. cell_det used
+                # to be refreshed only from the Home carousel's idle branch,
+                # so this screen showed a frozen snapshot.
+                fresh = refresher.get("celldet")
+                if fresh is not None and fresh is not cell_det:
+                    cell_det = fresh
+                    sub_dirty = True
+
+            if sub_notice_until and now >= sub_notice_until:
+                sub_notice_until = 0.0
+                sub_dirty = True        # repaint without the expired notice
+
             if sub_dirty:
                 if view == "devices":
                     img = panel_devices(devices)
@@ -8297,6 +8409,7 @@ def mode_live():
                     img = panel_sms_detail(sms_messages[idx])
                 else:
                     img = render_sub(view, cfg, oc, traf)
+                sub_notice_until = notice["until"] if draw_notice(img) else 0.0
                 write_frame(img)
                 sub_dirty = False
 
@@ -8352,6 +8465,7 @@ def mode_live():
                             base = panel_cellular(cell_det)
                             ok = run_with_spinner(base, "Redialing…", reconnect_cellular, ACCENT["sim"], min_visible=0.8)
                             cell_det = get_cellular_detail()
+                            refresher.put("celldet", cell_det)
                             if not ok:
                                 show_notice("Cellular didn't come back within 60s")
                         else:
@@ -8463,6 +8577,7 @@ def mode_live():
                         sub_dirty = True
                     elif key == "modem_cpu":
                         cell_det = get_cellular_detail()
+                        refresher.put("celldet", cell_det)
                         view = "cellular"
                         sub_dirty = True
                     elif key:
