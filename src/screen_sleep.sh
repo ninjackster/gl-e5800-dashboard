@@ -40,7 +40,10 @@ STATE_FILE=/root/dashboard/.backlight_saved
 case "$1" in
     off)
         cur=$(cat "$BL/brightness" 2>/dev/null)
-        [ -n "$cur" ] && [ "$cur" -gt 0 ] && echo "$cur" > "$STATE_FILE"
+        # Only write when it changed: the screen idles off every 30s and
+        # this file lives on the eMMC overlay.
+        [ -n "$cur" ] && [ "$cur" -gt 0 ] && [ "$cur" != "$(cat "$STATE_FILE" 2>/dev/null)" ] \
+            && echo "$cur" > "$STATE_FILE"
         echo 1 > "$FB_BLANK" 2>/dev/null
         echo 0 > "$BL/brightness"
         ;;

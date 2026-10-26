@@ -505,10 +505,10 @@ class Refresher:
         self.version = 0
 
     def add(self, name, fn, interval, initial=None, run_now=True, asleep_factor=None):
+        factor = self.ASLEEP_FACTOR if asleep_factor is None else asleep_factor
         with self.lock:
             self._values[name] = initial
-        factor = self.ASLEEP_FACTOR if asleep_factor is None else asleep_factor
-        self._jobs.append([name, fn, interval, 0.0 if run_now else time.time() + interval, factor])
+            self._jobs.append([name, fn, interval, 0.0 if run_now else time.time() + interval, factor])
 
     def get(self, name, default=None):
         with self.lock:
@@ -525,24 +525,27 @@ class Refresher:
 
     def refresh_all(self):
         """Run every job as soon as the worker next wakes (screen wake)."""
-        for job in self._jobs:
-            job[3] = 0.0
+        with self.lock:
+            for job in self._jobs:
+                job[3] = 0.0
         self._wake.set()
 
     def set_interval(self, name, interval):
         """Fork: change a job's period. A shorter period takes effect now
         rather than after the old, longer wait runs out."""
-        for job in self._jobs:
-            if job[0] == name and job[2] != interval:
-                job[2] = interval
-                job[3] = min(job[3], time.time() + interval)
-                self._wake.set()
+        with self.lock:
+            for job in self._jobs:
+                if job[0] == name and job[2] != interval:
+                    job[2] = interval
+                    job[3] = min(job[3], time.time() + interval)
+                    self._wake.set()
 
     def request(self, name):
         """Ask for one job to run as soon as the worker next wakes."""
-        for job in self._jobs:
-            if job[0] == name:
-                job[3] = 0.0
+        with self.lock:
+            for job in self._jobs:
+                if job[0] == name:
+                    job[3] = 0.0
         self._wake.set()
 
     def start(self):
@@ -553,16 +556,24 @@ class Refresher:
             now = time.time()
             sleep_for = 5.0
             asleep = is_screen_asleep()
-            for job in self._jobs:
-                name, fn, interval, next_at, factor = job
+            with self.lock:
+                jobs = list(self._jobs)
+            for job in jobs:
+                with self.lock:
+                    name, fn, interval, next_at, factor = job
                 if now >= next_at:
                     try:
                         value = fn()
                     except Exception:
                         value = None
-                    job[3] = time.time() + interval * (factor if asleep else 1)
-                    if value is not None:
-                        with self.lock:
+                    with self.lock:
+                        # Fork: a refresh_all()/request() that landed while
+                        # fn() ran reset next_at to 0; keep it rather than
+                        # pushing the job a full interval out (stale data
+                        # for up to 30s after a wake).
+                        if job[3] == next_at:
+                            job[3] = time.time() + job[2] * (factor if asleep else 1)
+                        if value is not None:
                             self._values[name] = value
                             self.version += 1
                 else:
@@ -3599,7 +3610,7 @@ NET_FAILOVER_Y = 262
 NET_TOGGLE_RECT = (172, 42, 218, 64)
 CELL_RECONNECT_RECT = (16, 278, 116, 306)
 CELL_SIM_RECT = (124, 278, W - 16, 306)
-CELL_HISTORY_MAX = 120      # 5s refresher ticks -> 10 minutes
+CELL_HISTORY_MAX = 300      # 2s aiming-mode samples -> 10 minutes
 CELL_HISTORY_S = 600        # the screen says "last 10 min": trim by age, not count
 _cell_history = []
 
@@ -3652,11 +3663,11 @@ def get_cellular_detail():
         slot = int(modem.get("current_sim_slot", 1))
     except (TypeError, ValueError):
         slot = 1
+    _cell_slot["slot"] = slot
     raw = ubus_call("cellular.network", "cell_info", {"bus": "cpu", "slot": slot})
     info = ubus_call("cellular.network", "info", {"bus": "cpu", "slot": slot})
     net = next(iter(info.get("networks") or []), {}) or {}
-    sig = [s for s in (raw.get("signal") or []) if _cell_int(s.get("band")) and _cell_int(s.get("network_type"))]
-    prim = sorted(sig, key=lambda s: _cell_int(s.get("ca")) or 0)[0] if sig else {}
+    prim = _cell_primary(raw)
     iface = ubus_call("network.interface.modem_cpu", "status")
     ipv4 = net.get("ipv4") or {}
     det = {
@@ -3676,7 +3687,35 @@ def get_cellular_detail():
     # count cap alone let 120 samples stretch to 40+ minutes.
     _cell_history[:] = [h for h in _cell_history if now - h[0] <= CELL_HISTORY_S][-CELL_HISTORY_MAX:]
     det["history"] = list(_cell_history)
+    det["ts"] = now
     return det
+
+
+_cell_slot = {"slot": 1}
+
+
+def _cell_primary(raw):
+    """The primary (non-aggregated) carrier's signal entry from cell_info."""
+    sig = [s for s in (raw.get("signal") or []) if _cell_int(s.get("band")) and _cell_int(s.get("network_type"))]
+    return sorted(sig, key=lambda s: _cell_int(s.get("ca")) or 0)[0] if sig else {}
+
+
+def get_cellular_signal():
+    """Fork: aiming mode. Signal only -- one ubus call, on the slot the last
+    full get_cellular_detail() found -- so the Cellular screen can poll it
+    every 2s while someone moves the Mudi around."""
+    raw = ubus_call("cellular.network", "cell_info", {"bus": "cpu", "slot": _cell_slot["slot"]})
+    prim = _cell_primary(raw)
+    sig = {"registered": bool(prim), "rsrp": _cell_int(prim.get("rsrp")),
+           "rsrq": _cell_int(prim.get("rsrq")), "sinr": _cell_int(prim.get("sinr")),
+           "pci": _cell_int(prim.get("pci"))}
+    now = time.time()
+    if sig["rsrp"] is not None and sig["rsrp"] > -200:
+        _cell_history.append((now, sig["rsrp"], sig["sinr"]))
+    _cell_history[:] = [h for h in _cell_history if now - h[0] <= CELL_HISTORY_S][-CELL_HISTORY_MAX:]
+    sig["history"] = list(_cell_history)
+    sig["ts"] = now
+    return sig
 
 
 def set_wan_iface_up(iface, up):
@@ -6677,13 +6716,15 @@ touch_state = TouchState()
 
 def _touch_reader():
     import os as _os
+    import select as _select
     start_x = start_y = None
     last_x = None
     last_t = 0.0
     down = False
     slot = 0
     try:
-        f = open(TOUCH_DEV, "rb")
+        # Unbuffered so select() below sees every pending event.
+        f = open(TOUCH_DEV, "rb", buffering=0)
     except Exception as e:
         # Losing the touch device leaves a dashboard that still redraws
         # happily but ignores every tap. That used to be a single line on
@@ -6703,7 +6744,10 @@ def _touch_reader():
                 except (BlockingIOError, TypeError):
                     data = None
                 if not data or len(data) < _EVENT_SIZE:
-                    time.sleep(0.008)
+                    # Fork: block until a touch arrives (1s cap so _stop is
+                    # still noticed). The 8ms sleep-poll woke the CPU ~123
+                    # times a second even with the screen asleep.
+                    _select.select([fd], [], [], 1.0)
                     continue
                 _, _, typ, code, val = struct.unpack(_EVENT_FMT, data)
                 if typ != EV_ABS:
@@ -6845,9 +6889,17 @@ def mode_live():
     # CELLDET_BG_S then, CELLDET_OPEN_S while the screen is showing (the
     # main loop switches it). Its four ubus calls every 5s around the clock
     # repeated the "cell" job's two.
-    CELLDET_OPEN_S, CELLDET_BG_S = 5, 30
+    CELLDET_OPEN_S, CELLDET_BG_S = 10, 30
     refresher.add("celldet", get_cellular_detail, CELLDET_BG_S)
-    celldet_interval = CELLDET_BG_S
+    # Aiming mode, Networks and Devices only poll while their screens are
+    # open (OPEN intervals); otherwise they idle at SUB_IDLE_S. Fetching
+    # them here keeps their subprocess calls off the touch/render thread.
+    SUB_IDLE_S = 3600
+    CELLSIG_OPEN_S, NETS_OPEN_S, DEVICES_OPEN_S = 2, 5, 2
+    refresher.add("cellsig", get_cellular_signal, SUB_IDLE_S, run_now=False)
+    refresher.add("nets", get_networks_state, SUB_IDLE_S, run_now=False)
+    refresher.add("devices", get_devices, SUB_IDLE_S, run_now=False)
+    sub_intervals = {}
     refresher.add("sms", get_sms_messages, 15)
     # Full pace even while asleep: it carries the hotel-portal flag that
     # wakes the screen (see the asleep branch of the main loop).
@@ -6885,7 +6937,6 @@ def mode_live():
     cell_det = {}
     otg = {}
     devices = []
-    last_dev_fetch = 0.0
     last_wan_dev = get_wan_iface()     # fork: failover alerts
     # Started before any default route existed (boot): the first route to
     # appear is the starting state, not a failover worth a banner.
@@ -6898,6 +6949,8 @@ def mode_live():
     wan_none_since = None
     last_wan_check = 0.0
     sub_notice_until = 0.0     # when the notice painted on a sub-screen expires
+    cell_sig_seen = None       # last aiming-mode sample seen from the refresher
+    cell_det_seen = None       # last full cellular detail seen from the refresher
     last_portal = False
     if last_wan_dev and "rmnet" in last_wan_dev:
         _cell_session.update(dev=last_wan_dev, start_bytes=_dev_bytes(last_wan_dev))
@@ -7347,7 +7400,8 @@ def mode_live():
                       and abs(final_dy) <= TAP_JITTER_PX)
             if is_tap and hit_back(down_y):
                 view = "networks"      # fork: Repeater lives under Networks
-                net = get_networks_state()
+                net = refresher.get("nets", net)
+                refresher.request("nets")
                 sub_dirty = True
             elif is_tap:
                 action, val = hit_repeater(down_x, down_y, rep, len(rep_networks), picker_scroll_base)
@@ -7862,11 +7916,15 @@ def mode_live():
             last_wan_check = now
             check_wan_change()
 
-        # Fork: the Cellular screen polls fast only while it is showing.
-        want_celldet = CELLDET_OPEN_S if view == "cellular" else CELLDET_BG_S
-        if want_celldet != celldet_interval:
-            celldet_interval = want_celldet
-            refresher.set_interval("celldet", want_celldet)
+        # Fork: screen-specific polls run fast only while their screen shows.
+        in_networks = view in ("networks", "net_detail", "cellular", "repeater")
+        for job, want in (("celldet", CELLDET_OPEN_S if view == "cellular" else CELLDET_BG_S),
+                          ("cellsig", CELLSIG_OPEN_S if view == "cellular" else SUB_IDLE_S),
+                          ("nets", NETS_OPEN_S if in_networks else SUB_IDLE_S),
+                          ("devices", DEVICES_OPEN_S if view == "devices" else SUB_IDLE_S)):
+            if sub_intervals.get(job) != want:
+                sub_intervals[job] = want
+                refresher.set_interval(job, want)
 
         # Fork: idle auto-dim / wake-on-touch.
         if dim["on"]:
@@ -8066,6 +8124,7 @@ def mode_live():
                                                    ACCENT["clock"])
                             if got:
                                 net, rep = got
+                                refresher.put("nets", net)
                             new_view = "networks"
                         elif name == "clock" and zone == "more":
                             new_view = "more"
@@ -8195,7 +8254,7 @@ def mode_live():
                             new_view = "speedtest"
                         elif name == "monitor" and zone == "devices":
                             devices = get_devices()
-                            last_dev_fetch = now
+                            refresher.put("devices", devices)
                             new_view = "devices"
                         elif name == "games" and zone and zone.startswith("play:"):
                             active_game = zone.split(":", 1)[1]
@@ -8363,18 +8422,34 @@ def mode_live():
                 time.sleep(0.012)
                 continue
 
-            if view == "devices" and now - last_dev_fetch > 2:
-                devices = get_devices()
-                last_dev_fetch = now
-                sub_dirty = True
+            if view == "devices":
+                fresh = refresher.get("devices")
+                if fresh is not None and fresh is not devices:
+                    devices = fresh
+                    sub_dirty = True
+
+            if view in ("networks", "net_detail"):
+                fresh = refresher.get("nets")
+                if fresh is not None and fresh is not net:
+                    net = fresh
+                    sub_dirty = True
 
             if view == "cellular":
+                fresh_sig = refresher.get("cellsig")
+                if fresh_sig is not None and fresh_sig is not cell_sig_seen:
+                    cell_sig_seen = fresh_sig
+                    if fresh_sig.get("ts", 0) > cell_det.get("ts", 0):
+                        cell_det = dict(cell_det, **fresh_sig)
+                        sub_dirty = True
                 # Fork: live signal while the screen is open. cell_det used
                 # to be refreshed only from the Home carousel's idle branch,
                 # so this screen showed a frozen snapshot.
                 fresh = refresher.get("celldet")
-                if fresh is not None and fresh is not cell_det:
-                    cell_det = fresh
+                if fresh is not None and fresh is not cell_det_seen:
+                    cell_det_seen = fresh
+                    cell_det = dict(fresh)
+                    if cell_sig_seen and cell_sig_seen.get("ts", 0) > fresh.get("ts", 0):
+                        cell_det.update(cell_sig_seen)    # aiming sample is newer
                     sub_dirty = True
 
             if sub_notice_until and now >= sub_notice_until:
@@ -8452,10 +8527,13 @@ def mode_live():
                     elif confirm_action.startswith("otg_role:"):
                         role = confirm_action.split(":")[1]
                         base = panel_tethering(net, otg)
-                        ok = run_with_spinner(base, "Switching USB-C…", lambda: set_otg_role(role),
-                                              ACCENT["clock"], min_visible=0.8)
-                        otg = get_otg_state()
-                        net = get_networks_state()
+                        got = run_with_spinner(base, "Switching USB-C…",
+                                               lambda: (set_otg_role(role), get_otg_state(), get_networks_state()),
+                                               ACCENT["clock"], min_visible=0.8)
+                        ok = bool(got and got[0])
+                        if got:
+                            otg, net = got[1], got[2]
+                            refresher.put("nets", net)
                         if not ok:
                             show_notice("USB-C mode didn't change")
                         view = confirm_return_view
@@ -8463,17 +8541,25 @@ def mode_live():
                     elif confirm_action.startswith("net_toggle:") or confirm_action == "cell_reconnect":
                         if confirm_action == "cell_reconnect":
                             base = panel_cellular(cell_det)
-                            ok = run_with_spinner(base, "Redialing…", reconnect_cellular, ACCENT["sim"], min_visible=0.8)
-                            cell_det = get_cellular_detail()
-                            refresher.put("celldet", cell_det)
+                            got = run_with_spinner(base, "Redialing…",
+                                                   lambda: (reconnect_cellular(), get_cellular_detail()),
+                                                   ACCENT["sim"], min_visible=0.8)
+                            ok = bool(got and got[0])
+                            if got:
+                                cell_det = got[1]
+                                refresher.put("celldet", cell_det)
                             if not ok:
                                 show_notice("Cellular didn't come back within 60s")
                         else:
                             _, iface, val = confirm_action.split(":")
                             base = panel_net_detail(net, net_detail_key)
-                            ok = run_with_spinner(base, "Applying…", lambda: set_wan_iface_up(iface, val == "on"),
-                                                  ACCENT["clock"], min_visible=0.8)
-                            net = get_networks_state()
+                            got = run_with_spinner(base, "Applying…",
+                                                   lambda: (set_wan_iface_up(iface, val == "on"), get_networks_state()),
+                                                   ACCENT["clock"], min_visible=0.8)
+                            ok = bool(got and got[0])
+                            if got:
+                                net = got[1]
+                                refresher.put("nets", net)
                             if not ok:
                                 show_notice(f"{iface} didn't change state within 20s")
                         view = confirm_return_view
@@ -8565,7 +8651,8 @@ def mode_live():
                     sub_dirty = True
                 elif is_tap and view in ("net_detail", "cellular") and hit_back(down_y):
                     view = "networks"
-                    net = get_networks_state()
+                    net = refresher.get("nets", net)
+                    refresher.request("nets")
                     sub_dirty = True
                 elif is_tap and view == "networks" and not hit_back(down_y):
                     key = hit_networks(down_x, down_y, net)
@@ -8576,7 +8663,10 @@ def mode_live():
                         view = "repeater"
                         sub_dirty = True
                     elif key == "modem_cpu":
-                        cell_det = get_cellular_detail()
+                        # Four ubus calls: under the spinner, not a frozen frame.
+                        got = run_with_spinner(panel_networks(net, rep), "Loading…",
+                                               get_cellular_detail, ACCENT["sim"])
+                        cell_det = got or cell_det
                         refresher.put("celldet", cell_det)
                         view = "cellular"
                         sub_dirty = True

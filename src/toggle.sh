@@ -32,6 +32,11 @@ case "$1" in
     off)
         /etc/init.d/citydash stop
         wait_gone "dashboard/run.sh"
+        # If run.sh had to be SIGKILLed it never relayed the stop, so make
+        # sure the Python child is gone too before gl_screen takes /dev/fb0.
+        pids=$(pgrep -f "^python3 /root/dashboard/dashboard.py" 2>/dev/null)
+        [ -n "$pids" ] && kill $pids 2>/dev/null
+        wait_gone "^python3 /root/dashboard/dashboard.py"
         /etc/init.d/citydash disable
         /etc/init.d/gl_screen enable
         /etc/init.d/gl_screen start

@@ -67,6 +67,7 @@ where it can be attacked safely:
     router would come back up in the wrong one.
 """
 import os
+import select
 import struct
 import subprocess
 import time
@@ -131,6 +132,18 @@ def do_sleep_toggle():
     log("tap -> sleep toggle")
 
 
+def _wait_timeout(down_at, pending_release, acted):
+    """Seconds until main() next has something to decide with no new edge:
+    a tentative release confirming, or a held press crossing HOLD_MIN.
+    None (wait for the next edge) when idle or nothing is pending."""
+    now = time.time()
+    if pending_release is not None:
+        return max(0.0, CONFIRM_WINDOW - (now - pending_release))
+    if down_at is not None and not acted and now - down_at < HOLD_MIN:
+        return HOLD_MIN - (now - down_at)
+    return None
+
+
 def main():
     down_at = None          # when the current press episode first started
     pending_release = None  # timestamp of the most recent release edge,
@@ -138,7 +151,9 @@ def main():
                             # further press
     acted = False           # this episode already produced an action
 
-    with open(DEV, "rb") as f:
+    # Unbuffered: select() watches the fd, so no event may sit in a Python
+    # read buffer where select() can't see it.
+    with open(DEV, "rb", buffering=0) as f:
         fd = f.fileno()
         os.set_blocking(fd, False)
         while True:
@@ -159,7 +174,11 @@ def main():
                     elif val == 0 and down_at is not None:
                         pending_release = time.time()
             else:
-                time.sleep(0.005)
+                # Block in the kernel until the next edge, or until the one
+                # deadline the current episode is waiting on. The old 5ms
+                # sleep-poll woke the CPU ~196 times a second around the
+                # clock (measured 2026-10-25), more than the dashboard.
+                select.select([fd], [], [], _wait_timeout(down_at, pending_release, acted))
 
             now = time.time()
 
